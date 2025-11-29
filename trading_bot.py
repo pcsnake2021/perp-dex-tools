@@ -4,11 +4,13 @@ Modular Trading Bot - Supports multiple exchanges
 
 import os
 import time
+import json
+import uuid
 import asyncio
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, List
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -81,11 +83,20 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        self.last_executed_quantity = self.config.quantity
+        self.exit_requested = False
+        self.start_time = time.time()
         
         # Position mismatch tracking
         self.mismatch_start_time = None  # Timestamp when mismatch was first detected
         self.mismatch_detected = False  # Current mismatch status
         self.position_mismatch_disconnected = False  # Whether we disconnected due to mismatch
+        
+        # Account tracking for Telegram bot
+        self.initial_margin = None  # Initial margin balance when bot started
+        self.trade_count = 0  # Total number of trades executed
+        self.telegram_bot = None  # Telegram bot instance for command handling
+        self.command_handling_task = None  # Task for handling Telegram commands
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -209,7 +220,11 @@ class TradingBot:
                 self.config.quantity,
                 self.config.direction
             )
-
+            executed_qty = getattr(order_result, 'size', self.config.quantity)
+            if executed_qty is None:
+                executed_qty = self.config.quantity
+            executed_qty = Decimal(str(executed_qty))
+            self.last_executed_quantity = executed_qty
             if not order_result.success:
                 return False
 
@@ -234,11 +249,21 @@ class TradingBot:
         order_id = order_result.order_id
         filled_price = order_result.price
 
+        actual_quantity = getattr(order_result, 'size', None)
+        if actual_quantity is not None:
+            actual_quantity = Decimal(str(actual_quantity))
+        if actual_quantity is None or actual_quantity == 0:
+            filled_amount = getattr(self, 'order_filled_amount', None)
+            if filled_amount is not None and filled_amount != 0:
+                actual_quantity = Decimal(str(filled_amount))
+            else:
+                actual_quantity = self.config.quantity
+
         if self.order_filled_event.is_set() or order_result.status == 'FILLED':
             if self.config.boost_mode:
                 close_order_result = await self.exchange_client.place_market_order(
                     self.config.contract_id,
-                    self.config.quantity,
+                    actual_quantity,
                     self.config.close_order_side
                 )
             else:
@@ -252,7 +277,7 @@ class TradingBot:
 
                 close_order_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
-                    self.config.quantity,
+                    actual_quantity,
                     close_price,
                     close_side
                 )
@@ -414,9 +439,12 @@ class TradingBot:
                 self.logger.log(f"Current Position: {position_amt} | Active closing amount: {active_close_amount} | "
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
+                # Refresh snapshot for multi-account Telegram status
+                await self.get_account_status(include_trade_count=True)
                 
                 # Check for position mismatch
-                if abs(position_amt - active_close_amount) > (2 * self.config.quantity):
+                quantity_threshold = max(self.config.quantity, getattr(self, 'last_executed_quantity', self.config.quantity))
+                if abs(position_amt - active_close_amount) > (2 * quantity_threshold):
                     # First time detecting mismatch
                     if not self.mismatch_detected:
                         self.mismatch_start_time = time.time()
@@ -681,6 +709,512 @@ class TradingBot:
         if telegram_token and telegram_chat_id:
             with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                 tg_bot.send_text(message)
+    
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin. Returns None if not available."""
+        try:
+            # Try to get balance from exchange client if method exists
+            if hasattr(self.exchange_client, 'get_account_balance'):
+                return await self.exchange_client.get_account_balance()
+            
+            # For other exchanges, this is a placeholder - each exchange may need specific implementation
+            return None
+        except Exception as e:
+            self.logger.log(f"Error getting account balance: {e}", "WARNING")
+            return None
+    
+    def _shared_runtime_root(self) -> str:
+        """Directory shared across all bot instances for Telegram coordination."""
+        default_root = os.path.join(os.path.expanduser("~"), ".perp_dex_bot")
+        root = os.getenv("TELEGRAM_SHARED_RUNTIME", default_root)
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _status_snapshot_dir(self) -> str:
+        base_dir = os.path.join(self._shared_runtime_root(), "telegram_status")
+        os.makedirs(base_dir, exist_ok=True)
+        return base_dir
+
+    def _status_snapshot_path(self) -> str:
+        account_name = os.getenv('ACCOUNT_NAME', 'DEFAULT')
+        safe_account = "".join(c if c.isalnum() or c in "-_" else "_" for c in account_name)
+        filename = f"{safe_account}_{self.config.exchange}_{self.config.ticker}.json"
+        return os.path.join(self._status_snapshot_dir(), filename)
+
+    def _write_status_snapshot(self, status_text: str):
+        snapshot = {
+            "account": os.getenv('ACCOUNT_NAME', 'DEFAULT'),
+            "exchange": self.config.exchange,
+            "ticker": self.config.ticker,
+            "timestamp": time.time(),
+            "status": status_text
+        }
+        try:
+            with open(self._status_snapshot_path(), "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.logger.log(f"Failed to write status snapshot: {e}", "WARNING")
+
+    def _collect_status_snapshots(self) -> List[str]:
+        base_dir = self._status_snapshot_dir()
+        snapshots: List[tuple] = []
+        try:
+            for filename in os.listdir(base_dir):
+                if not filename.endswith(".json"):
+                    continue
+                path = os.path.join(base_dir, filename)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        status_text = data.get("status")
+                        timestamp = data.get("timestamp", 0)
+                        if status_text:
+                            snapshots.append((timestamp, status_text))
+                except Exception:
+                    continue
+        except FileNotFoundError:
+            pass
+        snapshots.sort(key=lambda item: item[0], reverse=True)
+        return [status for _, status in snapshots]
+
+    def _format_duration(self, seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        days, remainder = divmod(seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, secs = divmod(remainder, 60)
+        parts = []
+        if days:
+            parts.append(f"{days}天")
+        if hours or parts:
+            parts.append(f"{hours}小时")
+        if minutes or parts:
+            parts.append(f"{minutes}分")
+        parts.append(f"{secs}秒")
+        return "".join(parts)
+
+    def _command_queue_dir(self) -> str:
+        base_dir = os.path.join(self._shared_runtime_root(), "telegram_commands")
+        os.makedirs(base_dir, exist_ok=True)
+        return base_dir
+
+    def _enqueue_command(self, command_name: str, args: str, metadata: Optional[dict] = None):
+        queue_dir = self._command_queue_dir()
+        payload = {
+            "command": command_name.lower(),
+            "args": args or "",
+            "created": time.time(),
+            "metadata": metadata or {}
+        }
+
+        dedup_key = None
+        if metadata:
+            dedup_key = metadata.get("update_id") or metadata.get("message_id")
+
+        if dedup_key:
+            filename = f"{command_name.strip('/')}_{dedup_key}.json"
+        else:
+            filename = f"{int(payload['created'] * 1000)}_{uuid.uuid4().hex}.json"
+
+        path = os.path.join(queue_dir, filename)
+
+        if dedup_key:
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                self.logger.log(f"Enqueued unique command {command_name} with key {dedup_key}", "INFO")
+                return
+            except FileExistsError:
+                self.logger.log(f"Command {command_name} with key {dedup_key} already enqueued. Skipping duplicate.", "INFO")
+                return
+            except Exception as e:
+                self.logger.log(f"Failed to enqueue Telegram command {command_name}: {e}", "ERROR")
+                return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.logger.log(f"Failed to enqueue Telegram command {command_name}: {e}", "ERROR")
+
+    async def _process_exit_command(self, target_account: str) -> bool:
+        account_name = os.getenv('ACCOUNT_NAME', 'DEFAULT')
+        if not target_account:
+            await self.send_notification("❌ /exit 命令需要指定账户名，例如 /exit ACCOUNT_NAME")
+            return True
+
+        if target_account.lower() != account_name.lower():
+            return False
+
+        if self.exit_requested:
+            self.logger.log("Exit already in progress. Ignoring duplicate /exit command.", "WARNING")
+            return True
+
+        self.logger.log(f"/exit command received for account {account_name}", "WARNING")
+        self.exit_requested = True
+        success = await self.close_all_positions_and_orders()
+        if success:
+            final_status = await self.get_account_status(include_trade_count=True)
+            final_status += "\n\n<b>所有交易已关闭，程序即将退出</b>\n"
+            final_status += "<b>All trades closed, program exiting...</b>"
+            await self.send_notification(final_status)
+            self.shutdown_requested = True
+            await self.graceful_shutdown("Exit command received from Telegram")
+        else:
+            await self.send_notification("❌ Failed to close all positions and orders. Please check manually.")
+            self.exit_requested = False
+
+        return True
+
+    async def _process_local_command_queue(self):
+        queue_dir = self._command_queue_dir()
+        try:
+            entries = sorted(
+                [f for f in os.listdir(queue_dir) if f.endswith(".json")]
+            )
+        except FileNotFoundError:
+            return
+
+        for entry in entries:
+            path = os.path.join(queue_dir, entry)
+            lock_path = f"{path}.lock"
+            try:
+                os.replace(path, lock_path)
+            except OSError:
+                continue
+
+            handled = False
+            try:
+                with open(lock_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                command_name = data.get("command", "").lower()
+                args = data.get("args", "")
+                metadata = data.get("metadata", {})
+
+                if command_name == "/status":
+                    handled = await self._handle_status_command()
+                elif command_name == "/exit":
+                    handled = await self._process_exit_command(args.strip())
+                else:
+                    self.logger.log(f"Unknown Telegram command: {command_name}", "WARNING")
+                    handled = True
+
+            except Exception as e:
+                self.logger.log(f"Error processing Telegram command file {entry}: {e}", "ERROR")
+                handled = True
+            finally:
+                if handled:
+                    try:
+                        os.remove(lock_path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    try:
+                        os.replace(lock_path, path)
+                    except OSError:
+                        pass
+
+    async def get_account_status(self, include_trade_count: bool = False, update_snapshot: bool = True) -> str:
+        """Get formatted account status message."""
+        try:
+            account_name = os.getenv('ACCOUNT_NAME', 'DEFAULT')
+            exchange_name = self.config.exchange.upper()
+            ticker = self.config.ticker.upper()
+            
+            # Get current balance
+            current_balance = await self.get_account_balance()
+            balance_str = f"{current_balance:.4f}" if current_balance is not None else "N/A"
+            
+            # Get position
+            position_amt = await self.exchange_client.get_account_positions()
+            position_amt = abs(position_amt)
+            
+            # Get active orders
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            total_order_size = sum(order.size for order in active_orders)
+            
+            # Calculate PnL & APR
+            initial_margin_str = f"{self.initial_margin:.4f}" if self.initial_margin is not None else "N/A"
+            pnl_absolute = None
+            pnl_abs_str = "N/A"
+            pnl_pct_str = "N/A"
+            apr_str = "N/A"
+            runtime_seconds = max(0.0, time.time() - self.start_time)
+            runtime_str = self._format_duration(runtime_seconds)
+            if self.initial_margin is not None and current_balance is not None:
+                pnl_absolute = current_balance - self.initial_margin
+                if self.initial_margin > 0:
+                    pnl_percentage = (pnl_absolute / self.initial_margin) * Decimal(100)
+                else:
+                    pnl_percentage = Decimal(0)
+                pnl_abs_str = f"{pnl_absolute:+.4f}"
+                pnl_pct_str = f"{pnl_percentage:+.2f}%"
+
+                runtime_year_fraction = Decimal(str(runtime_seconds)) / Decimal('31536000') if runtime_seconds > 0 else None
+                if runtime_year_fraction and runtime_year_fraction > 0 and self.initial_margin > 0:
+                    apr_value = (pnl_absolute / self.initial_margin) / runtime_year_fraction * Decimal(100)
+                    apr_str = f"{apr_value:+.2f}%"
+
+            
+            # Build status message
+            status = f"<b>🧾 账户状态报告</b>\n"
+            status += f"<b>📋 Account Status Report</b>\n\n"
+            status += f"<b>👤 账户名称 Account Name:</b> {account_name}\n"
+            status += f"<b>🏦 交易所 Exchange:</b> {exchange_name}\n"
+            status += f"<b>💰 初始保证金 Initial Margin:</b> {initial_margin_str}\n"
+            status += f"<b>🎯 交易对 Ticker:</b> {ticker}\n"
+            status += f"<b>⏱️ 运行时长 Runtime:</b> {runtime_str}\n\n"
+            status += f"<b>💼 当前保证金 Current Margin:</b> {balance_str}\n"
+            status += f"<b>📊 持仓 Position:</b> {position_amt}\n"
+            status += f"<b>📑 挂单数量 Active Orders:</b> {len(active_orders)}\n"
+            status += f"<b>⚖️ 挂单总量 Order Size:</b> {total_order_size}\n"
+            
+            if include_trade_count:
+                status += f"<b>🔁 累计交易次数 Total Trades:</b> {self.trade_count}\n"
+            
+            status += f"\n<b>💹 账户盈亏 PnL:</b>\n"
+            status += f"<b>📈 绝对盈亏 Absolute:</b> {pnl_abs_str}\n"
+            status += f"<b>📉 百分比盈亏 Percentage:</b> {pnl_pct_str}\n"
+            status += f"<b>📅 年化收益 APR:</b> {apr_str}\n"
+
+            if update_snapshot:
+                self._write_status_snapshot(status)
+            
+            return status
+        except Exception as e:
+            self.logger.log(f"Error getting account status: {e}", "ERROR")
+            return f"Error getting account status: {str(e)}"
+
+    async def _handle_status_command(self) -> bool:
+        """Send combined status for all connected accounts."""
+        # Refresh our own snapshot
+        await self.get_account_status(include_trade_count=True, update_snapshot=True)
+        snapshots = self._collect_status_snapshots()
+        if not snapshots:
+            return True
+
+        for snapshot in snapshots:
+            if self.telegram_bot:
+                self.telegram_bot.send_text(snapshot)
+            else:
+                await self.send_notification(snapshot)
+            await asyncio.sleep(0.2)  # small delay to avoid flooding
+
+        return True
+    
+    async def _wait_for_no_active_orders(self, timeout: int = 30) -> bool:
+        """Repeatedly cancel orders until none remain or timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            if len(active_orders) == 0:
+                return True
+
+            for order in active_orders:
+                try:
+                    await self.exchange_client.cancel_order(order.order_id)
+                except Exception as cancel_err:
+                    self.logger.log(f"Error canceling order {order.order_id}: {cancel_err}", "WARNING")
+
+            await asyncio.sleep(1)
+
+        self.logger.log("Timeout waiting for active orders to cancel", "WARNING")
+        return False
+
+    async def _wait_for_flat_position(self, threshold: Decimal = Decimal("0.0001"), timeout: int = 60) -> bool:
+        """Attempt to flatten position until below threshold or timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            position_amt = await self.exchange_client.get_account_positions()
+            if abs(position_amt) <= threshold:
+                return True
+
+            close_side = 'sell' if position_amt > 0 else 'buy'
+
+            if hasattr(self.exchange_client, 'place_market_order'):
+                try:
+                    result = await self.exchange_client.place_market_order(
+                        self.config.contract_id,
+                        abs(position_amt),
+                        close_side
+                    )
+                    if result.success:
+                        self.logger.log(f"Attempted market close of {abs(position_amt)} while waiting for flat position", "INFO")
+                except Exception as market_err:
+                    self.logger.log(f"Market close attempt failed during exit: {market_err}", "WARNING")
+
+            else:
+                try:
+                    best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                    if best_bid > 0 and best_ask > 0:
+                        if close_side == 'sell':
+                            price = best_bid - self.config.tick_size
+                        else:
+                            price = best_ask + self.config.tick_size
+                        price = self.exchange_client.round_to_tick(price)
+                        result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            abs(position_amt),
+                            price,
+                            close_side
+                        )
+                        if result.success:
+                            self.logger.log(f"Reissued close order while waiting for flat position: {abs(position_amt)} @ {price}", "INFO")
+                except Exception as limit_err:
+                    self.logger.log(f"Limit close attempt failed during exit: {limit_err}", "WARNING")
+
+            await asyncio.sleep(2)
+
+        self.logger.log("Timeout waiting for position to close", "WARNING")
+        return False
+
+    async def close_all_positions_and_orders(self) -> bool:
+        """Close all positions and cancel all orders."""
+        try:
+            self.logger.log("Closing all positions and canceling all orders...", "INFO")
+            
+            # Try to cancel all orders at once if method exists (e.g., Backpack)
+            if hasattr(self.exchange_client, 'cancel_all_orders'):
+                try:
+                    result = await self.exchange_client.cancel_all_orders(self.config.contract_id)
+                    self.logger.log("Canceled all orders using cancel_all_orders method", "INFO")
+                except Exception as e:
+                    self.logger.log(f"Failed to cancel all orders at once: {e}, trying individually...", "WARNING")
+                    # Fallback to individual cancellation
+                    active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                    for order in active_orders:
+                        try:
+                            await self.exchange_client.cancel_order(order.order_id)
+                            self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                        except Exception as e:
+                            self.logger.log(f"Failed to cancel order {order.order_id}: {e}", "WARNING")
+            else:
+                # Cancel orders individually
+                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                for order in active_orders:
+                    try:
+                        await self.exchange_client.cancel_order(order.order_id)
+                        self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                    except Exception as e:
+                        self.logger.log(f"Failed to cancel order {order.order_id}: {e}", "WARNING")
+            
+            orders_cleared = await self._wait_for_no_active_orders()
+            if not orders_cleared:
+                self.logger.log("Proceeding to close position even though some orders remain open", "WARNING")
+
+            # Close all positions using market order
+            position_amt = await self.exchange_client.get_account_positions()
+            if abs(position_amt) > Decimal('0.0001'):  # Small threshold to avoid floating point issues
+                close_side = 'sell' if position_amt > 0 else 'buy'
+                
+                # Try to use market order if available
+                if hasattr(self.exchange_client, 'place_market_order'):
+                    result = await self.exchange_client.place_market_order(
+                        self.config.contract_id,
+                        abs(position_amt),
+                        close_side
+                    )
+                    if result.success:
+                        self.logger.log(f"Closed position: {abs(position_amt)} using market order", "INFO")
+                    else:
+                        self.logger.log(f"Failed to close position: {result.error_message}", "ERROR")
+                        return False
+                else:
+                    # Use limit order at market price
+                    best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                    if best_bid > 0 and best_ask > 0:
+                        if close_side == 'sell':
+                            price = best_bid - self.config.tick_size
+                        else:
+                            price = best_ask + self.config.tick_size
+                        
+                        price = self.exchange_client.round_to_tick(price)
+                        result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            abs(position_amt),
+                            price,
+                            close_side
+                        )
+                        if result.success:
+                            self.logger.log(f"Placed close order: {abs(position_amt)} @ {price}", "INFO")
+                        else:
+                            self.logger.log(f"Failed to place close order: {result.error_message}", "ERROR")
+                            return False
+                    else:
+                        self.logger.log("Cannot get market prices for closing position", "ERROR")
+                        return False
+
+                flat = await self._wait_for_flat_position()
+                if not flat:
+                    self.logger.log("Failed to flatten position within timeout window", "ERROR")
+                    return False
+            
+            return True
+        except Exception as e:
+            self.logger.log(f"Error closing positions and orders: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return False
+    
+    async def handle_telegram_commands(self):
+        """Handle Telegram commands in background."""
+        telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        
+        if not telegram_token or not telegram_chat_id:
+            return
+        
+        self.telegram_bot = TelegramBot(telegram_token, telegram_chat_id)
+        
+        # Register command handlers
+        async def handle_status_command(command: dict):
+            metadata = {
+                "update_id": command.get("update_id"),
+                "message_id": command.get("message_id"),
+                "chat_id": command.get("chat_id")
+            }
+            self._enqueue_command("/status", command.get("args", ""), metadata)
+        
+        async def handle_exit_command(command: dict):
+            metadata = {
+                "update_id": command.get("update_id"),
+                "message_id": command.get("message_id"),
+                "chat_id": command.get("chat_id")
+            }
+            self._enqueue_command("/exit", command.get("args", ""), metadata)
+        
+        # Register handlers (wrapped to handle async)
+        def status_wrapper(command: dict):
+            if self.loop:
+                self.loop.create_task(handle_status_command(command))
+            else:
+                asyncio.create_task(handle_status_command(command))
+        
+        def exit_wrapper(command: dict):
+            if self.loop:
+                self.loop.create_task(handle_exit_command(command))
+            else:
+                asyncio.create_task(handle_exit_command(command))
+        
+        self.telegram_bot.register_command("/status", status_wrapper)
+        self.telegram_bot.register_command("/exit", exit_wrapper)
+        
+        # Poll for updates
+        while not self.shutdown_requested:
+            try:
+                updates = self.telegram_bot.get_updates(timeout=5, offset=self.telegram_bot.last_update_id + 1)
+                commands = self.telegram_bot.process_updates(updates)
+                
+                for cmd in commands:
+                    handler = self.telegram_bot.command_handlers.get(cmd["command"])
+                    if handler:
+                        handler(cmd)
+
+                await self._process_local_command_queue()
+                await asyncio.sleep(1)
+            except Exception as e:
+                self.logger.log(f"Error handling Telegram commands: {e}", "ERROR")
+                await asyncio.sleep(5)
 
     async def run(self):
         """Main trading loop."""
@@ -710,6 +1244,21 @@ class TradingBot:
 
             # wait for connection to establish
             await asyncio.sleep(5)
+            
+            # Get initial margin balance
+            self.initial_margin = await self.get_account_balance()
+            if self.initial_margin is None:
+                self.logger.log("Warning: Could not get initial margin balance", "WARNING")
+            
+            # Start Telegram command handling
+            telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+            telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+            if telegram_token and telegram_chat_id:
+                self.command_handling_task = asyncio.create_task(self.handle_telegram_commands())
+                # Send initial account status
+                initial_status = await self.get_account_status(include_trade_count=False)
+                initial_status = "<b>🚀 交易机器人启动</b>\n<b>Trading Bot Started</b>\n\n" + initial_status
+                await self.send_notification(initial_status)
 
             # Main trading loop
             while not self.shutdown_requested:
@@ -764,6 +1313,10 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
 
+                if self.exit_requested:
+                    await asyncio.sleep(1)
+                    continue
+
                 if not mismatch_detected:
                     wait_time = self._calculate_wait_time()
 
@@ -776,8 +1329,10 @@ class TradingBot:
                             await asyncio.sleep(1)
                             continue
 
-                        await self._place_and_monitor_open_order()
-                        self.last_close_orders += 1
+                        order_executed = await self._place_and_monitor_open_order()
+                        if order_executed:
+                            self.last_close_orders += 1
+                            self.trade_count += 1
 
         except KeyboardInterrupt:
             self.logger.log("Bot stopped by user")
@@ -788,6 +1343,14 @@ class TradingBot:
             await self.graceful_shutdown(f"Critical error: {e}")
             raise
         finally:
+            # Cancel Telegram command handling task
+            if self.command_handling_task:
+                self.command_handling_task.cancel()
+                try:
+                    await self.command_handling_task
+                except asyncio.CancelledError:
+                    pass
+            
             # Ensure all connections are closed even if graceful shutdown fails
             try:
                 await self.exchange_client.disconnect()

@@ -5,6 +5,7 @@ Simplified Paradex exchange client implementation - L2 credentials only.
 import os
 import asyncio
 import time
+import traceback
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Tuple
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
@@ -590,6 +591,87 @@ class ParadexClient(BaseExchangeClient):
                 return abs(Decimal(position.get('size', 0)).quantize(self.order_size_increment, rounding=ROUND_HALF_UP))
 
         return Decimal(0)
+
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            # Paradex uses fetch_balance() or similar method
+            balance_info = self.paradex.api_client.fetch_balance()
+            if not balance_info:
+                self.logger.log(f"Paradex: No balance info returned", "WARNING")
+                return None
+            
+            # Log balance_info type for debugging
+            self.logger.log(f"Paradex balance_info type: {type(balance_info)}", "DEBUG")
+            
+            # Try to get balance from balance data
+            if isinstance(balance_info, dict):
+                # Log available keys
+                self.logger.log(f"Paradex balance data keys: {list(balance_info.keys())[:10]}", "DEBUG")
+                
+                # Check for USDC balance (Paradex uses USDC)
+                usdc_balance = balance_info.get('USDC', {})
+                if isinstance(usdc_balance, dict):
+                    balance = usdc_balance.get('total') or usdc_balance.get('free') or usdc_balance.get('used')
+                    if balance is not None:
+                        try:
+                            return Decimal(str(balance))
+                        except (ValueError, TypeError) as e:
+                            self.logger.log(f"Paradex: Failed to convert USDC balance to Decimal: {balance}, error: {e}", "WARNING")
+                
+                # Try top-level fields
+                balance = (balance_info.get('equity') or 
+                         balance_info.get('balance') or 
+                         balance_info.get('totalEquity') or 
+                         balance_info.get('totalBalance') or
+                         balance_info.get('total') or
+                         balance_info.get('availableBalance') or
+                         balance_info.get('totalWalletBalance'))
+                
+                if balance is not None:
+                    try:
+                        return Decimal(str(balance))
+                    except (ValueError, TypeError) as e:
+                        self.logger.log(f"Paradex: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log sample data for debugging
+            self.logger.log(f"Paradex: Could not find balance field. Balance info sample: {str(balance_info)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            # Get all active orders
+            active_orders = await self.get_active_orders(contract_id)
+            
+            # Cancel each order individually
+            success_count = 0
+            for order in active_orders:
+                try:
+                    result = await self.cancel_order(order.order_id)
+                    if result.success:
+                        success_count += 1
+                        self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                    else:
+                        self.logger.log(f"Failed to cancel order {order.order_id}: {result.error_message}", "WARNING")
+                except Exception as e:
+                    self.logger.log(f"Error canceling order {order.order_id}: {e}", "ERROR")
+            
+            if success_count == len(active_orders):
+                return True
+            elif success_count > 0:
+                self.logger.log(f"Partially canceled orders: {success_count}/{len(active_orders)}", "WARNING")
+                return True  # Still return True if at least some were canceled
+            else:
+                return False
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False
 
     @retry(
         stop=stop_after_attempt(5),

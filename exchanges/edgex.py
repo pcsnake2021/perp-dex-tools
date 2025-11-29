@@ -12,6 +12,7 @@ from edgex_sdk import Client, OrderSide, WebSocketManager, CancelOrderParams, Ge
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
+from helpers.logger import TradingLogger
 
 
 class EdgeXClient(BaseExchangeClient):
@@ -571,3 +572,75 @@ class EdgeXClient(BaseExchangeClient):
         self.config.tick_size = Decimal(current_contract.get('tickSize'))
 
         return self.config.contract_id, self.config.tick_size
+
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            # EdgeX uses get_account_positions which also returns account info
+            positions_data = await self.client.get_account_positions()
+            if not positions_data or 'data' not in positions_data:
+                self.logger.log(f"EdgeX: No account data in positions response", "WARNING")
+                return None
+            
+            # Try to get balance from account data
+            account_data = positions_data.get('data', {})
+            
+            # Log available keys for debugging
+            if isinstance(account_data, dict):
+                self.logger.log(f"EdgeX account data keys: {list(account_data.keys())[:10]}", "DEBUG")
+            
+            # EdgeX may return balance/equity in different fields
+            # Try multiple possible field names
+            balance = (account_data.get('equity') or 
+                      account_data.get('balance') or 
+                      account_data.get('totalEquity') or 
+                      account_data.get('totalBalance') or
+                      account_data.get('accountEquity') or
+                      account_data.get('accountBalance') or
+                      account_data.get('totalValue') or
+                      account_data.get('accountValue'))
+            
+            if balance is not None:
+                try:
+                    return Decimal(str(balance))
+                except (ValueError, TypeError) as e:
+                    self.logger.log(f"EdgeX: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log the full account_data structure for debugging (first 500 chars)
+            self.logger.log(f"EdgeX: Could not find balance field. Account data sample: {str(account_data)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            # Get all active orders
+            active_orders = await self.get_active_orders(contract_id)
+            
+            # Cancel each order individually
+            success_count = 0
+            for order in active_orders:
+                try:
+                    result = await self.cancel_order(order.order_id)
+                    if result.success:
+                        success_count += 1
+                        self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                    else:
+                        self.logger.log(f"Failed to cancel order {order.order_id}: {result.error_message}", "WARNING")
+                except Exception as e:
+                    self.logger.log(f"Error canceling order {order.order_id}: {e}", "ERROR")
+            
+            if success_count == len(active_orders):
+                return True
+            elif success_count > 0:
+                self.logger.log(f"Partially canceled orders: {success_count}/{len(active_orders)}", "WARNING")
+                return True  # Still return True if at least some were canceled
+            else:
+                return False
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False

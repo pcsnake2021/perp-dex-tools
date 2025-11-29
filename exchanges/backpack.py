@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import sys
+import traceback
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -563,6 +564,205 @@ class BackpackClient(BaseExchangeClient):
                 position_amt = Decimal(position.get('netQuantity', 0))
                 break
         return position_amt
+    
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin.
+        
+        Backpack uses unified margin account. Net Equity = Total Margin Value + Total Unrealized PnL + Unsettled Funding - Total Borrowing Liability
+        """
+        try:
+            # Backpack uses unified margin account, try get_collateral() first
+            # This should return account equity/margin information
+            try:
+                collateral_info = self.account_client.get_collateral()
+                if collateral_info:
+                    if isinstance(collateral_info, dict):
+                        # Try to get net equity or total account value
+                        # Net Equity = Total Margin Value + Total Unrealized PnL + Unsettled Funding - Total Borrowing Liability
+                        net_equity = (collateral_info.get('netEquity') or 
+                                     collateral_info.get('netAccountValue') or
+                                     collateral_info.get('totalAccountValue') or 
+                                     collateral_info.get('totalValue') or 
+                                     collateral_info.get('equity') or
+                                     collateral_info.get('totalEquity') or
+                                     collateral_info.get('accountEquity') or
+                                     collateral_info.get('totalCollateral') or
+                                     collateral_info.get('availableCollateral') or
+                                     collateral_info.get('marginBalance') or
+                                     collateral_info.get('totalMargin'))
+                        
+                        if net_equity is not None:
+                            try:
+                                result = Decimal(str(net_equity))
+                                if result > 0:
+                                    return result
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        # If net equity not found, try to calculate it
+                        # Net Equity = Total Margin Value + Total Unrealized PnL + Unsettled Funding - Total Borrowing Liability
+                        total_margin = collateral_info.get('totalMarginValue') or collateral_info.get('totalMargin') or Decimal(0)
+                        unrealized_pnl = collateral_info.get('totalUnrealizedPnL') or collateral_info.get('unrealizedPnL') or Decimal(0)
+                        unsettled_funding = collateral_info.get('unsettledFunding') or collateral_info.get('unsettled') or Decimal(0)
+                        borrowing_liability = collateral_info.get('totalBorrowingLiability') or collateral_info.get('borrowingLiability') or Decimal(0)
+                        
+                        try:
+                            total_margin = Decimal(str(total_margin)) if total_margin else Decimal(0)
+                            unrealized_pnl = Decimal(str(unrealized_pnl)) if unrealized_pnl else Decimal(0)
+                            unsettled_funding = Decimal(str(unsettled_funding)) if unsettled_funding else Decimal(0)
+                            borrowing_liability = Decimal(str(borrowing_liability)) if borrowing_liability else Decimal(0)
+                            
+                            calculated_equity = total_margin + unrealized_pnl + unsettled_funding - borrowing_liability
+                            if calculated_equity > 0:
+                                return calculated_equity
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    elif isinstance(collateral_info, list) and len(collateral_info) > 0:
+                        # If collateral is a list, check first item
+                        if isinstance(collateral_info[0], dict):
+                            first_item = collateral_info[0]
+                            net_equity = (first_item.get('netEquity') or 
+                                         first_item.get('netAccountValue') or
+                                         first_item.get('totalAccountValue') or 
+                                         first_item.get('totalValue') or
+                                         first_item.get('equity') or
+                                         first_item.get('totalEquity'))
+                            
+                            if net_equity is not None:
+                                try:
+                                    result = Decimal(str(net_equity))
+                                    if result > 0:
+                                        return result
+                                except (ValueError, TypeError):
+                                    pass
+            except Exception:
+                pass
+            
+            # Fallback: try to get account equity from positions data
+            try:
+                positions_data = self.account_client.get_open_positions()
+                if positions_data:
+                    if isinstance(positions_data, dict):
+                        balance = (positions_data.get('accountEquity') or 
+                                  positions_data.get('accountBalance') or 
+                                  positions_data.get('totalEquity') or 
+                                  positions_data.get('totalBalance') or
+                                  positions_data.get('totalAccountValue') or
+                                  positions_data.get('availableBalance') or
+                                  positions_data.get('marginBalance') or
+                                  positions_data.get('totalMargin') or
+                                  positions_data.get('equity') or
+                                  positions_data.get('balance') or
+                                  positions_data.get('walletBalance') or
+                                  positions_data.get('totalWalletBalance'))
+                        
+                        if balance is not None:
+                            try:
+                                result = Decimal(str(balance))
+                                if result > 0:
+                                    return result
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    elif isinstance(positions_data, list) and len(positions_data) > 0:
+                        if isinstance(positions_data[0], dict):
+                            first_pos = positions_data[0]
+                            balance = (first_pos.get('accountEquity') or 
+                                      first_pos.get('accountBalance') or 
+                                      first_pos.get('totalEquity') or
+                                      first_pos.get('marginBalance') or
+                                      first_pos.get('equity') or
+                                      first_pos.get('balance') or
+                                      first_pos.get('walletBalance') or
+                                      first_pos.get('totalWalletBalance'))
+                            if balance is not None:
+                                try:
+                                    result = Decimal(str(balance))
+                                    if result > 0:
+                                        return result
+                                except (ValueError, TypeError):
+                                    pass
+            except Exception:
+                pass
+            
+            # Fallback to get_balances() to get account balances
+            balances_info = self.account_client.get_balances()
+            
+            if isinstance(balances_info, dict):
+                # Try to get total account value from balances
+                balance = (balances_info.get('totalAccountValue') or 
+                          balances_info.get('totalValue') or 
+                          balances_info.get('total') or
+                          balances_info.get('equity') or
+                          balances_info.get('totalEquity'))
+                
+                if balance is not None:
+                    try:
+                        return Decimal(str(balance))
+                    except (ValueError, TypeError) as e:
+                        self.logger.log(f"Backpack: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+                
+                # Backpack returns balances as a dict where keys are currency symbols
+                # Each currency has 'available', 'locked', 'staked' fields
+                # For perpetual trading, we typically use USDC balance
+                if 'USDC' in balances_info:
+                    usdc_bal = balances_info['USDC']
+                    if isinstance(usdc_bal, dict):
+                        available = Decimal(str(usdc_bal.get('available', '0')))
+                        locked = Decimal(str(usdc_bal.get('locked', '0')))
+                        staked = Decimal(str(usdc_bal.get('staked', '0')))
+                        total_usdc = available + locked + staked
+                        
+                        if total_usdc >= 0:
+                            return total_usdc
+                
+                # If no USDC or USDC is 0, try to sum all balances
+                total_value = Decimal(0)
+                for currency, bal_data in balances_info.items():
+                    if isinstance(bal_data, dict):
+                        available = Decimal(str(bal_data.get('available', '0')))
+                        locked = Decimal(str(bal_data.get('locked', '0')))
+                        staked = Decimal(str(bal_data.get('staked', '0')))
+                        currency_total = available + locked + staked
+                        total_value += currency_total
+                
+                if total_value >= 0:
+                    return total_value
+                        
+            elif isinstance(balances_info, list) and len(balances_info) > 0:
+                total_value = Decimal(0)
+                for bal in balances_info:
+                    if isinstance(bal, dict):
+                        value = (bal.get('total') or 
+                                bal.get('available') or 
+                                bal.get('value') or
+                                bal.get('totalAccountValue') or
+                                bal.get('totalValue') or
+                                Decimal(0))
+                        try:
+                            total_value += Decimal(str(value))
+                        except (ValueError, TypeError):
+                            pass
+                
+                if total_value >= 0:
+                    return total_value
+            
+            self.logger.log(f"Backpack: Could not find balance field", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            return None
+    
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            result = self.account_client.cancel_all_orders(symbol=contract_id)
+            return True
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""

@@ -8,6 +8,7 @@ import json
 import time
 import hmac
 import hashlib
+import traceback
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -738,6 +739,78 @@ class AsterClient(BaseExchangeClient):
                 return position_amt
 
         return Decimal(0)
+
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            # Aster uses /fapi/v2/account endpoint
+            result = await self._make_request('GET', '/fapi/v2/account')
+            if not result:
+                self.logger.log(f"Aster: No account data returned", "WARNING")
+                return None
+            
+            # Log available keys for debugging
+            if isinstance(result, dict):
+                self.logger.log(f"Aster account data keys: {list(result.keys())[:10]}", "DEBUG")
+            
+            # Try to get balance from account data
+            # Aster Binance-style API typically uses totalWalletBalance
+            balance = (result.get('totalWalletBalance') or 
+                      result.get('totalMarginBalance') or 
+                      result.get('availableBalance') or 
+                      result.get('balance') or
+                      result.get('totalEquity') or
+                      result.get('totalBalance') or
+                      result.get('accountEquity'))
+            
+            if balance is not None:
+                try:
+                    return Decimal(str(balance))
+                except (ValueError, TypeError) as e:
+                    self.logger.log(f"Aster: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log sample data for debugging
+            self.logger.log(f"Aster: Could not find balance field. Account data sample: {str(result)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            # Aster supports cancel all orders via DELETE /fapi/v1/allOpenOrders
+            result = await self._make_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': contract_id})
+            if result and 'code' in result and result['code'] == 200:
+                self.logger.log(f"Canceled all orders for {contract_id}", "INFO")
+                return True
+            else:
+                # Fallback to individual cancellation
+                active_orders = await self.get_active_orders(contract_id)
+                success_count = 0
+                for order in active_orders:
+                    try:
+                        result = await self.cancel_order(order.order_id)
+                        if result.success:
+                            success_count += 1
+                            self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                        else:
+                            self.logger.log(f"Failed to cancel order {order.order_id}: {result.error_message}", "WARNING")
+                    except Exception as e:
+                        self.logger.log(f"Error canceling order {order.order_id}: {e}", "ERROR")
+                
+                if success_count == len(active_orders):
+                    return True
+                elif success_count > 0:
+                    self.logger.log(f"Partially canceled orders: {success_count}/{len(active_orders)}", "WARNING")
+                    return True
+                else:
+                    return False
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size for a ticker."""

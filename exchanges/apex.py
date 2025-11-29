@@ -544,6 +544,75 @@ class ApexClient(BaseExchangeClient):
                 position_amt = 0
         return position_amt
 
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            account_data = self.rest_client.get_account_v3()
+            if not account_data:
+                self.logger.log(f"Apex: No account data returned", "WARNING")
+                return None
+            
+            # Log available keys for debugging
+            if isinstance(account_data, dict):
+                self.logger.log(f"Apex account data keys: {list(account_data.keys())[:10]}", "DEBUG")
+            
+            # Apex returns balance/equity in different fields
+            # Try multiple possible field names
+            balance = (account_data.get('equity') or 
+                      account_data.get('balance') or 
+                      account_data.get('totalEquity') or 
+                      account_data.get('totalBalance') or 
+                      account_data.get('accountValue') or
+                      account_data.get('totalAccountValue') or
+                      account_data.get('availableBalance') or
+                      account_data.get('totalWalletBalance') or
+                      account_data.get('totalMarginBalance'))
+            
+            if balance is not None:
+                try:
+                    return Decimal(str(balance))
+                except (ValueError, TypeError) as e:
+                    self.logger.log(f"Apex: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log the full account_data structure for debugging (first 500 chars)
+            self.logger.log(f"Apex: Could not find balance field. Account data sample: {str(account_data)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            # Get all active orders
+            active_orders = await self.get_active_orders(contract_id)
+            
+            # Cancel each order individually
+            success_count = 0
+            for order in active_orders:
+                try:
+                    result = await self.cancel_order(order.order_id)
+                    if result.success:
+                        success_count += 1
+                        self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                    else:
+                        self.logger.log(f"Failed to cancel order {order.order_id}: {result.error_message}", "WARNING")
+                except Exception as e:
+                    self.logger.log(f"Error canceling order {order.order_id}: {e}", "ERROR")
+            
+            if success_count == len(active_orders):
+                return True
+            elif success_count > 0:
+                self.logger.log(f"Partially canceled orders: {success_count}/{len(active_orders)}", "WARNING")
+                return True  # Still return True if at least some were canceled
+            else:
+                return False
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
         ticker = self.config.ticker

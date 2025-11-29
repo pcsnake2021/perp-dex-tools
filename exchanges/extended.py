@@ -609,6 +609,92 @@ class ExtendedClient(BaseExchangeClient):
             else:
                 position_amt = 0
         return position_amt
+
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            # Extended uses account.get_account() or similar method
+            account_info = await self.perpetual_trading_client.account.get_account()
+            if not account_info:
+                self.logger.log(f"Extended: No account info returned", "WARNING")
+                return None
+            
+            # Log account_info type and attributes for debugging
+            self.logger.log(f"Extended account_info type: {type(account_info)}", "DEBUG")
+            if hasattr(account_info, '__dict__'):
+                self.logger.log(f"Extended account_info attributes: {list(account_info.__dict__.keys())[:10]}", "DEBUG")
+            
+            # Try to get balance from account data
+            balance = None
+            if hasattr(account_info, 'equity'):
+                balance = account_info.equity
+            elif hasattr(account_info, 'balance'):
+                balance = account_info.balance
+            elif hasattr(account_info, 'total_equity'):
+                balance = account_info.total_equity
+            elif hasattr(account_info, 'total_balance'):
+                balance = account_info.total_balance
+            elif hasattr(account_info, 'totalEquity'):
+                balance = account_info.totalEquity
+            elif hasattr(account_info, 'totalBalance'):
+                balance = account_info.totalBalance
+            elif isinstance(account_info, dict):
+                # Log available keys
+                self.logger.log(f"Extended account data keys: {list(account_info.keys())[:10]}", "DEBUG")
+                
+                balance = (account_info.get('equity') or 
+                          account_info.get('balance') or 
+                          account_info.get('totalEquity') or 
+                          account_info.get('totalBalance') or
+                          account_info.get('total_equity') or
+                          account_info.get('total_balance') or
+                          account_info.get('availableBalance') or
+                          account_info.get('totalWalletBalance'))
+            
+            if balance is not None:
+                try:
+                    return Decimal(str(balance))
+                except (ValueError, TypeError) as e:
+                    self.logger.log(f"Extended: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log sample data for debugging
+            self.logger.log(f"Extended: Could not find balance field. Account info sample: {str(account_info)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            # Get all active orders
+            active_orders = await self.get_active_orders(contract_id)
+            
+            # Cancel each order individually
+            success_count = 0
+            for order in active_orders:
+                try:
+                    result = await self.cancel_order(order.order_id)
+                    if result.success:
+                        success_count += 1
+                        self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                    else:
+                        self.logger.log(f"Failed to cancel order {order.order_id}: {result.error_message}", "WARNING")
+                except Exception as e:
+                    self.logger.log(f"Error canceling order {order.order_id}: {e}", "ERROR")
+            
+            if success_count == len(active_orders):
+                return True
+            elif success_count > 0:
+                self.logger.log(f"Partially canceled orders: {success_count}/{len(active_orders)}", "WARNING")
+                return True  # Still return True if at least some were canceled
+            else:
+                return False
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False
     
     async def handle_account(self, message):
         """Handle order updates from WebSocket using correct pattern."""

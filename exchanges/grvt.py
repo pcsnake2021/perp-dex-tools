@@ -5,6 +5,7 @@ GRVT exchange client implementation.
 import os
 import asyncio
 import time
+import traceback
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 from pysdk.grvt_ccxt import GrvtCcxt
@@ -509,6 +510,87 @@ class GrvtClient(BaseExchangeClient):
                 return abs(Decimal(position.get('size', 0)))
 
         return Decimal(0)
+
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            # GRVT uses fetch_balance() or similar method
+            balance_info = self.rest_client.fetch_balance()
+            if not balance_info:
+                self.logger.log(f"GRVT: No balance info returned", "WARNING")
+                return None
+            
+            # Log balance_info type for debugging
+            self.logger.log(f"GRVT balance_info type: {type(balance_info)}", "DEBUG")
+            
+            # Try to get balance from balance data
+            if isinstance(balance_info, dict):
+                # Log available keys
+                self.logger.log(f"GRVT balance data keys: {list(balance_info.keys())[:10]}", "DEBUG")
+                
+                # Check for USDT balance or total equity
+                usdt_balance = balance_info.get('USDT', {})
+                if isinstance(usdt_balance, dict):
+                    balance = usdt_balance.get('total') or usdt_balance.get('free') or usdt_balance.get('used')
+                    if balance is not None:
+                        try:
+                            return Decimal(str(balance))
+                        except (ValueError, TypeError) as e:
+                            self.logger.log(f"GRVT: Failed to convert USDT balance to Decimal: {balance}, error: {e}", "WARNING")
+                
+                # Try top-level fields
+                balance = (balance_info.get('equity') or 
+                          balance_info.get('balance') or 
+                          balance_info.get('totalEquity') or 
+                          balance_info.get('totalBalance') or
+                          balance_info.get('total') or
+                          balance_info.get('availableBalance') or
+                          balance_info.get('totalWalletBalance'))
+                
+                if balance is not None:
+                    try:
+                        return Decimal(str(balance))
+                    except (ValueError, TypeError) as e:
+                        self.logger.log(f"GRVT: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log sample data for debugging
+            self.logger.log(f"GRVT: Could not find balance field. Balance info sample: {str(balance_info)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
+    async def cancel_all_orders(self, contract_id: str) -> bool:
+        """Cancel all orders for a contract."""
+        try:
+            # Get all active orders
+            active_orders = await self.get_active_orders(contract_id)
+            
+            # Cancel each order individually
+            success_count = 0
+            for order in active_orders:
+                try:
+                    result = await self.cancel_order(order.order_id)
+                    if result.success:
+                        success_count += 1
+                        self.logger.log(f"Canceled order: {order.order_id}", "INFO")
+                    else:
+                        self.logger.log(f"Failed to cancel order {order.order_id}: {result.error_message}", "WARNING")
+                except Exception as e:
+                    self.logger.log(f"Error canceling order {order.order_id}: {e}", "ERROR")
+            
+            if success_count == len(active_orders):
+                return True
+            elif success_count > 0:
+                self.logger.log(f"Partially canceled orders: {success_count}/{len(active_orders)}", "WARNING")
+                return True  # Still return True if at least some were canceled
+            else:
+                return False
+        except Exception as e:
+            self.logger.log(f"Failed to cancel all orders: {e}", "ERROR")
+            return False
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size for a ticker."""
