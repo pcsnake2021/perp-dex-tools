@@ -107,6 +107,15 @@ class TradingBot:
         self.shutdown_requested = True
 
         try:
+            # Delete status snapshot file to prevent /status from showing this account
+            try:
+                snapshot_path = self._status_snapshot_path()
+                if os.path.exists(snapshot_path):
+                    os.remove(snapshot_path)
+                    self.logger.log(f"Deleted status snapshot file: {snapshot_path}", "INFO")
+            except Exception as e:
+                self.logger.log(f"Failed to delete status snapshot: {e}", "WARNING")
+
             # Disconnect from exchange
             await self.exchange_client.disconnect()
             self.logger.log("Graceful shutdown completed", "INFO")
@@ -758,6 +767,10 @@ class TradingBot:
     def _collect_status_snapshots(self) -> List[str]:
         base_dir = self._status_snapshot_dir()
         snapshots: List[tuple] = []
+        current_time = time.time()
+        # Consider account inactive if snapshot is older than 5 minutes
+        max_age_seconds = 300  # 5 minutes
+        
         try:
             for filename in os.listdir(base_dir):
                 if not filename.endswith(".json"):
@@ -768,6 +781,16 @@ class TradingBot:
                         data = json.load(f)
                         status_text = data.get("status")
                         timestamp = data.get("timestamp", 0)
+                        
+                        # Skip if snapshot is too old (account likely exited)
+                        age = current_time - timestamp
+                        if age > max_age_seconds:
+                            self.logger.log(
+                                f"Skipping stale snapshot {filename} (age: {age:.0f}s > {max_age_seconds}s)",
+                                "DEBUG"
+                            )
+                            continue
+                        
                         if status_text:
                             snapshots.append((timestamp, status_text))
                 except Exception:
@@ -776,6 +799,55 @@ class TradingBot:
             pass
         snapshots.sort(key=lambda item: item[0], reverse=True)
         return [status for _, status in snapshots]
+
+    async def _get_position_mmr(self) -> Optional[Decimal]:
+        """Get Maintenance Margin Requirement (MMR) for current position.
+        
+        Returns MMR as a percentage (e.g., 2.5 for 2.5%), or None if not available.
+        """
+        try:
+            # Try to get MMR from exchange-specific account info
+            # Different exchanges may have different APIs for this
+            exchange_name = self.config.exchange.lower()
+            
+            if exchange_name == "backpack":
+                # Backpack: Try to get from collateral info
+                try:
+                    if hasattr(self.exchange_client, 'account_client'):
+                        collateral_info = self.exchange_client.account_client.get_collateral()
+                        if collateral_info:
+                            if isinstance(collateral_info, dict):
+                                # Look for maintenance margin rate
+                                mmr = (collateral_info.get('maintenanceMarginRate') or
+                                      collateral_info.get('maintenanceMargin') or
+                                      collateral_info.get('mmr') or
+                                      collateral_info.get('maintenanceMarginRatio'))
+                                if mmr is not None:
+                                    return Decimal(str(mmr)) * Decimal(100)  # Convert to percentage
+                except Exception:
+                    pass
+            
+            elif exchange_name == "edgex":
+                # EdgeX: Try to get from account positions data
+                try:
+                    if hasattr(self.exchange_client, 'client'):
+                        positions_data = await self.exchange_client.client.get_account_positions()
+                        if positions_data and 'data' in positions_data:
+                            account_data = positions_data.get('data', {})
+                            mmr = (account_data.get('maintenanceMarginRate') or
+                                  account_data.get('maintenanceMargin') or
+                                  account_data.get('mmr'))
+                            if mmr is not None:
+                                return Decimal(str(mmr)) * Decimal(100)  # Convert to percentage
+                except Exception:
+                    pass
+            
+            # For other exchanges, return None to use calculated risk indicator
+            return None
+            
+        except Exception as e:
+            self.logger.log(f"Error getting MMR: {e}", "DEBUG")
+            return None
 
     def _format_duration(self, seconds: float) -> str:
         seconds = max(0, int(seconds))
@@ -934,6 +1006,65 @@ class TradingBot:
             active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
             total_order_size = sum(order.size for order in active_orders)
             
+            # Get current market price
+            current_price = None
+            price_str = "N/A"
+            try:
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                if best_bid > 0 and best_ask > 0:
+                    current_price = (best_bid + best_ask) / Decimal(2)
+                    price_str = f"{current_price:.4f}"
+            except Exception as e:
+                self.logger.log(f"Failed to get current price: {e}", "DEBUG")
+            
+            # Get trading direction
+            direction_str = self.config.direction.upper()
+            direction_icon = "📈" if direction_str == "BUY" else "📉"
+            
+            # Calculate MMR (Maintenance Margin Requirement) and risk level
+            mmr_str = "N/A"
+            mmr_risk_indicator = ""
+            if position_amt > 0 and current_balance is not None and current_price is not None:
+                try:
+                    # Try to get MMR from exchange account info
+                    mmr = await self._get_position_mmr()
+                    if mmr is None:
+                        # If MMR not available, calculate a risk indicator based on margin ratio
+                        # Risk indicator = (current_balance / position_value) * 100
+                        position_value = position_amt * current_price
+                        if position_value > 0:
+                            margin_ratio = (current_balance / position_value) * Decimal(100)
+                            # Use margin_ratio as a proxy for MMR risk
+                            # Lower margin_ratio = higher risk
+                            if margin_ratio < Decimal(5):
+                                mmr_risk_indicator = "🔴"  # Red: High risk
+                                mmr_str = f"{margin_ratio:.2f}% (高风险 High Risk)"
+                            elif margin_ratio < Decimal(10):
+                                mmr_risk_indicator = "🟡"  # Yellow: Medium risk
+                                mmr_str = f"{margin_ratio:.2f}% (中风险 Medium Risk)"
+                            else:
+                                mmr_risk_indicator = "🟢"  # Green: Low risk
+                                mmr_str = f"{margin_ratio:.2f}% (低风险 Low Risk)"
+                        else:
+                            mmr_str = "N/A"
+                    else:
+                        # Use actual MMR from exchange
+                        if mmr < Decimal(5):
+                            mmr_risk_indicator = "🔴"  # Red: High risk
+                            mmr_str = f"{mmr:.2f}% (高风险 High Risk)"
+                        elif mmr < Decimal(10):
+                            mmr_risk_indicator = "🟡"  # Yellow: Medium risk
+                            mmr_str = f"{mmr:.2f}% (中风险 Medium Risk)"
+                        else:
+                            mmr_risk_indicator = "🟢"  # Green: Low risk
+                            mmr_str = f"{mmr:.2f}% (低风险 Low Risk)"
+                except Exception as e:
+                    self.logger.log(f"Failed to calculate MMR: {e}", "DEBUG")
+                    mmr_str = "N/A"
+            elif position_amt == 0:
+                mmr_risk_indicator = "⚪"  # White: No position
+                mmr_str = "N/A (无持仓 No Position)"
+            
             # Calculate PnL & APR
             initial_margin_str = f"{self.initial_margin:.4f}" if self.initial_margin is not None else "N/A"
             pnl_absolute = None
@@ -964,9 +1095,12 @@ class TradingBot:
             status += f"<b>🏦 交易所 Exchange:</b> {exchange_name}\n"
             status += f"<b>💰 初始保证金 Initial Margin:</b> {initial_margin_str}\n"
             status += f"<b>🎯 交易对 Ticker:</b> {ticker}\n"
+            status += f"<b>💵 当前价格 Current Price:</b> {price_str}\n"
+            status += f"<b>{direction_icon} 交易方向 Direction:</b> {direction_str}\n"
             status += f"<b>⏱️ 运行时长 Runtime:</b> {runtime_str}\n\n"
             status += f"<b>💼 当前保证金 Current Margin:</b> {balance_str}\n"
             status += f"<b>📊 持仓 Position:</b> {position_amt}\n"
+            status += f"<b>{mmr_risk_indicator} 持仓MMR Position MMR:</b> {mmr_str}\n"
             status += f"<b>📑 挂单数量 Active Orders:</b> {len(active_orders)}\n"
             status += f"<b>⚖️ 挂单总量 Order Size:</b> {total_order_size}\n"
             
