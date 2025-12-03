@@ -49,6 +49,26 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    
+    # Profit protection parameters
+    parser.add_argument('--pp', nargs='*', type=float, default=None,
+                        help='Profit protection: --pp [xx] [yy]. '
+                             'When profit exceeds xx%%, start profit protection. '
+                             'When profit protection is active, if profit drawdown >= yy%% from peak, close all positions and enter silent mode. '
+                             'Default: xx=5, yy=50 if no args; yy=50 if only xx provided')
+    
+    # Stop loss parameters
+    parser.add_argument('--sl', nargs='?', type=float, default=None, const=10.0,
+                        help='Stop loss: --sl [xx]. '
+                             'If account drops by xx%% from initial capital, enter silent mode. '
+                             'Default: xx=10%% if no value provided')
+    
+    # Silent mode parameters
+    parser.add_argument('--sm', nargs='?', type=int, default=None, const=60,
+                        help='Silent mode: --sm [xx]. '
+                             'After profit protection or stop loss triggers, pause for xx minutes, then reset all parameters and restart. '
+                             'Default: xx=60 if no value provided. '
+                             'If --pp or --sl is set without --sm, --sm defaults to 60')
 
     return parser.parse_args()
 
@@ -102,6 +122,53 @@ async def main():
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
 
+    # Parse and validate profit protection parameters
+    profit_protection_threshold = None
+    profit_protection_drawdown = None
+    if args.pp is not None:
+        if len(args.pp) == 0:
+            # No arguments: default xx=5, yy=50
+            profit_protection_threshold = Decimal(5)
+            profit_protection_drawdown = Decimal(50)
+        elif len(args.pp) == 1:
+            # One argument: xx provided, default yy=50
+            profit_protection_threshold = Decimal(args.pp[0])
+            profit_protection_drawdown = Decimal(50)
+        elif len(args.pp) == 2:
+            # Two arguments: both xx and yy provided
+            profit_protection_threshold = Decimal(args.pp[0])
+            profit_protection_drawdown = Decimal(args.pp[1])
+        else:
+            print("Error: --pp accepts at most 2 arguments (xx and yy)")
+            sys.exit(1)
+        
+        # Validate parameters
+        if profit_protection_threshold <= 0 or profit_protection_drawdown <= 0:
+            print(f"Error: --pp parameters must be > 0. Got xx={profit_protection_threshold}, yy={profit_protection_drawdown}")
+            print("请重新设置参数 (Please reset parameters)")
+            sys.exit(1)
+    
+    # Parse and validate stop loss parameters
+    stop_loss_threshold = None
+    if args.sl is not None:
+        stop_loss_threshold = Decimal(args.sl)
+        if stop_loss_threshold <= 0:
+            print(f"Error: --sl parameter must be > 0. Got xx={stop_loss_threshold}")
+            print("请重新设置参数 (Please reset parameters)")
+            sys.exit(1)
+    
+    # Parse and validate silent mode parameters
+    silent_mode_duration = None
+    if args.sm is not None:
+        silent_mode_duration = args.sm
+        if silent_mode_duration <= 0:
+            print(f"Error: --sm parameter must be > 0. Got xx={silent_mode_duration}")
+            print("请重新设置参数 (Please reset parameters)")
+            sys.exit(1)
+    elif profit_protection_threshold is not None or stop_loss_threshold is not None:
+        # If pp or sl is set but sm is not, default sm to 60
+        silent_mode_duration = 60
+
     # Create configuration
     config = TradingConfig(
         ticker=args.ticker.upper(),
@@ -116,7 +183,11 @@ async def main():
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        profit_protection_threshold=profit_protection_threshold,
+        profit_protection_drawdown=profit_protection_drawdown,
+        stop_loss_threshold=stop_loss_threshold,
+        silent_mode_duration=silent_mode_duration
     )
 
     # Create and run the bot

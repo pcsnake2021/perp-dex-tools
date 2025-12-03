@@ -34,6 +34,10 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    profit_protection_threshold: Optional[Decimal] = None  # xx% profit to start protection
+    profit_protection_drawdown: Optional[Decimal] = None  # yy% drawdown from peak to trigger
+    stop_loss_threshold: Optional[Decimal] = None  # xx% loss from initial capital to trigger
+    silent_mode_duration: Optional[int] = None  # xx minutes to wait in silent mode
 
     @property
     def close_order_side(self) -> str:
@@ -97,6 +101,15 @@ class TradingBot:
         self.trade_count = 0  # Total number of trades executed
         self.telegram_bot = None  # Telegram bot instance for command handling
         self.command_handling_task = None  # Task for handling Telegram commands
+        
+        # Profit protection state
+        self.profit_protection_active = False  # Whether profit protection is currently active
+        self.peak_profit = Decimal(0)  # Highest profit reached (in absolute value)
+        self.peak_profit_percentage = Decimal(0)  # Highest profit percentage reached
+        
+        # Silent mode state
+        self.in_silent_mode = False  # Whether currently in silent mode
+        self.silent_mode_start_time = None  # When silent mode started
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -731,6 +744,155 @@ class TradingBot:
         except Exception as e:
             self.logger.log(f"Error getting account balance: {e}", "WARNING")
             return None
+    
+    async def _check_profit_protection(self) -> bool:
+        """Check profit protection conditions and trigger if needed.
+        
+        Returns:
+            True if profit protection was triggered (should enter silent mode)
+            False otherwise
+        """
+        if self.config.profit_protection_threshold is None:
+            return False
+        
+        if self.initial_margin is None:
+            return False
+        
+        current_balance = await self.get_account_balance()
+        if current_balance is None:
+            return False
+        
+        # Calculate current profit
+        current_profit = current_balance - self.initial_margin
+        if self.initial_margin > 0:
+            current_profit_percentage = (current_profit / self.initial_margin) * Decimal(100)
+        else:
+            current_profit_percentage = Decimal(0)
+        
+        # Check if profit exceeds threshold to start protection
+        if not self.profit_protection_active:
+            if current_profit_percentage >= self.config.profit_protection_threshold:
+                self.profit_protection_active = True
+                self.peak_profit = current_profit
+                self.peak_profit_percentage = current_profit_percentage
+                self.logger.log(f"利润保护已启动 (Profit protection activated): "
+                              f"当前盈利 {current_profit_percentage:.2f}% >= {self.config.profit_protection_threshold}%", "INFO")
+        
+        # If protection is active, check for drawdown
+        if self.profit_protection_active:
+            # Update peak if current profit is higher
+            if current_profit > self.peak_profit:
+                self.peak_profit = current_profit
+                self.peak_profit_percentage = current_profit_percentage
+                self.logger.log(f"利润新高 (New profit peak): {current_profit_percentage:.2f}%", "INFO")
+            
+            # Calculate drawdown from peak
+            if self.peak_profit > 0:
+                drawdown_from_peak = ((self.peak_profit - current_profit) / self.peak_profit) * Decimal(100)
+            else:
+                # If peak was 0 or negative, use percentage difference
+                drawdown_from_peak = self.peak_profit_percentage - current_profit_percentage
+            
+            # Check if drawdown exceeds threshold
+            if drawdown_from_peak >= self.config.profit_protection_drawdown:
+                self.logger.log(f"利润保护触发 (Profit protection triggered): "
+                              f"从峰值回撤 {drawdown_from_peak:.2f}% >= {self.config.profit_protection_drawdown}%", "WARNING")
+                return True
+        
+        return False
+    
+    async def _check_stop_loss(self) -> bool:
+        """Check stop loss conditions and trigger if needed.
+        
+        Returns:
+            True if stop loss was triggered (should enter silent mode)
+            False otherwise
+        """
+        if self.config.stop_loss_threshold is None:
+            return False
+        
+        if self.initial_margin is None:
+            return False
+        
+        current_balance = await self.get_account_balance()
+        if current_balance is None:
+            return False
+        
+        # Calculate loss from initial capital
+        loss = self.initial_margin - current_balance
+        if self.initial_margin > 0:
+            loss_percentage = (loss / self.initial_margin) * Decimal(100)
+        else:
+            loss_percentage = Decimal(0)
+        
+        # Check if loss exceeds threshold
+        if loss_percentage >= self.config.stop_loss_threshold:
+            self.logger.log(f"止损触发 (Stop loss triggered): "
+                          f"相对于初始本金下跌 {loss_percentage:.2f}% >= {self.config.stop_loss_threshold}%", "WARNING")
+            return True
+        
+        return False
+    
+    async def _enter_silent_mode(self, reason: str):
+        """Enter silent mode: close all positions, cancel orders, wait, then reset."""
+        if self.in_silent_mode:
+            return  # Already in silent mode
+        
+        self.in_silent_mode = True
+        self.silent_mode_start_time = time.time()
+        
+        self.logger.log(f"进入系统静默期 (Entering silent mode): {reason}", "WARNING")
+        
+        # Close all positions and cancel all orders
+        success = await self.close_all_positions_and_orders()
+        if not success:
+            self.logger.log("清仓和取消挂单时出现错误，但继续进入静默期", "WARNING")
+        
+        # Report account status
+        status = await self.get_account_status(include_trade_count=True)
+        status += f"\n\n<b>🔇 系统静默期已启动</b>\n"
+        status += f"<b>Silent Mode Activated</b>\n"
+        status += f"<b>原因 Reason:</b> {reason}\n"
+        if self.config.silent_mode_duration:
+            status += f"<b>静默时长 Duration:</b> {self.config.silent_mode_duration} 分钟 (minutes)\n"
+        await self.send_notification(status)
+        
+        # Wait for specified duration
+        if self.config.silent_mode_duration:
+            wait_seconds = self.config.silent_mode_duration * 60
+            self.logger.log(f"等待 {self.config.silent_mode_duration} 分钟后重置参数...", "INFO")
+            await asyncio.sleep(wait_seconds)
+        
+        # Reset all parameters
+        self.logger.log("重置所有参数 (Resetting all parameters)...", "INFO")
+        
+        # Reset initial margin and profit tracking
+        new_initial_margin = await self.get_account_balance()
+        if new_initial_margin is not None:
+            self.initial_margin = new_initial_margin
+            self.logger.log(f"新的初始保证金 (New initial margin): {new_initial_margin:.4f}", "INFO")
+        
+        # Reset profit protection state
+        self.profit_protection_active = False
+        self.peak_profit = Decimal(0)
+        self.peak_profit_percentage = Decimal(0)
+        
+        # Reset trade count
+        self.trade_count = 0
+        
+        # Reset start time
+        self.start_time = time.time()
+        
+        # Exit silent mode
+        self.in_silent_mode = False
+        self.silent_mode_start_time = None
+        
+        # Report new account status
+        new_status = await self.get_account_status(include_trade_count=False)
+        new_status = "<b>🔄 系统已重置，重新开始</b>\n<b>System Reset, Restarting</b>\n\n" + new_status
+        await self.send_notification(new_status)
+        
+        self.logger.log("系统静默期结束，参数已重置，重新开始交易", "INFO")
     
     def _shared_runtime_root(self) -> str:
         """Directory shared across all bot instances for Telegram coordination."""
@@ -1369,6 +1531,13 @@ class TradingBot:
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
+            if self.config.profit_protection_threshold is not None:
+                self.logger.log(f"Profit Protection: {self.config.profit_protection_threshold}% threshold, "
+                              f"{self.config.profit_protection_drawdown}% drawdown", "INFO")
+            if self.config.stop_loss_threshold is not None:
+                self.logger.log(f"Stop Loss: {self.config.stop_loss_threshold}%", "INFO")
+            if self.config.silent_mode_duration is not None:
+                self.logger.log(f"Silent Mode Duration: {self.config.silent_mode_duration} minutes", "INFO")
             self.logger.log("=============================", "INFO")
 
             # Capture the running event loop for thread-safe callbacks
@@ -1432,6 +1601,23 @@ class TradingBot:
                     await self.exchange_client.connect()
                     await asyncio.sleep(5)
                     self.position_mismatch_disconnected = False
+                    continue
+
+                # Check stop loss (before profit protection, as it's more critical)
+                # Skip checks if in silent mode
+                if not self.in_silent_mode:
+                    if await self._check_stop_loss():
+                        await self._enter_silent_mode("止损触发 (Stop loss triggered)")
+                        continue
+                    
+                    # Check profit protection
+                    if await self._check_profit_protection():
+                        await self._enter_silent_mode("利润保护触发 (Profit protection triggered)")
+                        continue
+                else:
+                    # In silent mode, just wait a bit and continue
+                    # _enter_silent_mode handles the full silent mode cycle
+                    await asyncio.sleep(10)
                     continue
 
                 stop_trading, pause_trading = await self._check_price_condition()
