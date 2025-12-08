@@ -6,9 +6,11 @@ import os
 import time
 import asyncio
 import traceback
+import csv
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
+from datetime import datetime, timedelta
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -82,6 +84,12 @@ class TradingBot:
         self.shutdown_requested = False
         self.loop = None
 
+        # Status tracking
+        self.start_time = None
+        self.initial_margin = None
+        self.connection_notification_sent = False
+        self.trade_count = 0  # Count of filled trades since program start
+
         # Register order callback
         self._setup_websocket_handlers()
 
@@ -128,6 +136,8 @@ class TradingBot:
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
                     self.logger.log_transaction(order_id, side, message.get('size'), message.get('price'), status)
+                    # Count filled trades (only count actual filled orders, not canceled)
+                    self.trade_count += 1
                 elif status == "CANCELED":
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
@@ -488,6 +498,368 @@ class TradingBot:
             with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
                 tg_bot.send_text(message)
 
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin from exchange."""
+        try:
+            # Try to use exchange-specific method if available
+            if hasattr(self.exchange_client, 'get_account_balance'):
+                try:
+                    return await asyncio.wait_for(
+                        self.exchange_client.get_account_balance(),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.log("Timeout getting account balance", "WARNING")
+                    return None
+                except Exception as e:
+                    self.logger.log(f"Error getting account balance: {e}", "WARNING")
+                    return None
+            
+            # Fallback: try get_account_margin for backward compatibility
+            if hasattr(self.exchange_client, 'get_account_margin'):
+                try:
+                    return await asyncio.wait_for(
+                        self.exchange_client.get_account_margin(),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.log("Timeout getting account margin", "WARNING")
+                    return None
+                except Exception as e:
+                    self.logger.log(f"Error getting account margin: {e}", "WARNING")
+                    return None
+            
+            # Fallback for Backpack
+            if self.config.exchange == "backpack":
+                if hasattr(self.exchange_client, 'account_client'):
+                    try:
+                        collateral_data = self.exchange_client.account_client.get_collateral()
+                        if collateral_data and isinstance(collateral_data, dict):
+                            total_collateral = collateral_data.get('totalCollateral', 0)
+                            if total_collateral:
+                                return Decimal(str(total_collateral))
+                    except Exception as e:
+                        self.logger.log(f"Error getting Backpack collateral: {e}", "WARNING")
+            
+            return None
+        except Exception as e:
+            self.logger.log(f"Error getting account balance: {e}", "WARNING")
+            return None
+    
+    async def _get_current_margin(self) -> Optional[Decimal]:
+        """Get current margin from exchange (deprecated, use get_account_balance)."""
+        return await self.get_account_balance()
+
+    def _get_total_trades(self) -> int:
+        """Get total number of filled trades since program start."""
+        # Return the count of filled trades since this program instance started
+        return self.trade_count
+
+    def _format_runtime(self) -> str:
+        """Format runtime duration."""
+        if not self.start_time:
+            return "未知"
+        
+        duration = time.time() - self.start_time
+        days = int(duration // 86400)
+        hours = int((duration % 86400) // 3600)
+        minutes = int((duration % 3600) // 60)
+        seconds = int(duration % 60)
+        
+        return f"{days}天{hours}小时{minutes}分{seconds}秒"
+
+    def _calculate_pnl(self, current_margin: Optional[Decimal], initial_margin: Optional[Decimal]) -> tuple:
+        """Calculate PnL (absolute and percentage)."""
+        if not current_margin or not initial_margin:
+            return None, None, None
+        
+        absolute_pnl = current_margin - initial_margin
+        percentage_pnl = (absolute_pnl / initial_margin) * Decimal(100) if initial_margin > 0 else Decimal(0)
+        
+        # Calculate APR (annualized return)
+        if self.start_time:
+            runtime_days = Decimal(time.time() - self.start_time) / Decimal(86400)
+            if runtime_days > 0:
+                apr = percentage_pnl * (Decimal(365) / runtime_days)
+            else:
+                apr = Decimal(0)
+        else:
+            apr = Decimal(0)
+        
+        return absolute_pnl, percentage_pnl, apr
+
+    async def get_status(self) -> str:
+        """Get formatted status report."""
+        try:
+            # Check if contract_id is set
+            if not hasattr(self.config, 'contract_id') or not self.config.contract_id:
+                return "交易对未初始化，请等待连接完成"
+            
+            # Get account name
+            account_name = os.getenv('ACCOUNT_NAME', 'N/A')
+            
+            # Get exchange name
+            exchange_name = self.config.exchange.upper()
+            
+            # Get ticker
+            ticker = self.config.ticker
+            
+            # Get current price with timeout
+            try:
+                best_bid, best_ask = await asyncio.wait_for(
+                    self.exchange_client.fetch_bbo_prices(self.config.contract_id),
+                    timeout=5.0
+                )
+                # Ensure both are Decimal
+                best_bid = Decimal(best_bid) if not isinstance(best_bid, Decimal) else best_bid
+                best_ask = Decimal(best_ask) if not isinstance(best_ask, Decimal) else best_ask
+                current_price = (best_bid + best_ask) / Decimal(2) if best_bid > 0 and best_ask > 0 else best_ask if best_ask > 0 else best_bid
+            except asyncio.TimeoutError:
+                self.logger.log("Timeout fetching price", "WARNING")
+                current_price = Decimal(0)
+            except Exception as e:
+                self.logger.log(f"Error fetching price: {e}", "WARNING")
+                current_price = Decimal(0)
+            
+            # Get direction with icon
+            direction = self.config.direction.upper()
+            direction_icon = "📈" if direction == "BUY" else "📉"
+            
+            # Get runtime
+            runtime = self._format_runtime()
+            
+            # Get initial and current margin with timeout
+            initial_margin = self.initial_margin or Decimal(0)
+            try:
+                current_margin = await asyncio.wait_for(
+                    self.get_account_balance(),
+                    timeout=5.0
+                )
+                if current_margin is None:
+                    current_margin = initial_margin
+            except asyncio.TimeoutError:
+                self.logger.log("Timeout getting current margin", "WARNING")
+                current_margin = initial_margin
+            except Exception as e:
+                self.logger.log(f"Error getting current margin: {e}", "WARNING")
+                current_margin = initial_margin
+            
+            # Get position with timeout
+            try:
+                position = await asyncio.wait_for(
+                    self.exchange_client.get_account_positions(),
+                    timeout=5.0
+                )
+                position = abs(position)
+            except asyncio.TimeoutError:
+                self.logger.log("Timeout getting position", "WARNING")
+                position = Decimal(0)
+            except Exception as e:
+                self.logger.log(f"Error getting position: {e}", "WARNING")
+                position = Decimal(0)
+            
+            # Calculate position MMR (Maintenance Margin Ratio) with risk indicator
+            # This is a simplified calculation - actual MMR depends on exchange
+            position_mmr = "N/A"
+            mmr_risk_indicator = ""
+            if position > 0 and current_margin > 0:
+                # Ensure current_price is Decimal
+                current_price_decimal = Decimal(current_price) if not isinstance(current_price, Decimal) else current_price
+                # Simplified: assume position value is position * current_price
+                position_value = position * current_price_decimal if current_price_decimal > 0 else Decimal(0)
+                if position_value > 0:
+                    mmr_ratio = (current_margin / position_value) * Decimal(100)
+                    # Convert to float for formatting
+                    mmr_ratio_float = float(mmr_ratio)
+                    # Risk indicator based on margin ratio (lower = higher risk)
+                    if mmr_ratio_float < 5:
+                        mmr_risk_indicator = "🔴"  # Red: High risk
+                        position_mmr = f"{mmr_ratio_float:.2f}% (高风险 High Risk)"
+                    elif mmr_ratio_float < 10:
+                        mmr_risk_indicator = "🟡"  # Yellow: Medium risk
+                        position_mmr = f"{mmr_ratio_float:.2f}% (中风险 Medium Risk)"
+                    else:
+                        mmr_risk_indicator = "🟢"  # Green: Low risk
+                        position_mmr = f"{mmr_ratio_float:.2f}% (低风险 Low Risk)"
+            elif position == 0:
+                mmr_risk_indicator = "⚪"  # White: No position
+                position_mmr = "N/A (无持仓 No Position)"
+            
+            # Get active orders with timeout
+            try:
+                active_orders = await asyncio.wait_for(
+                    self.exchange_client.get_active_orders(self.config.contract_id),
+                    timeout=5.0
+                )
+                close_orders = [o for o in active_orders if o.side == self.config.close_order_side]
+                order_count = len(close_orders)
+                order_size = sum(o.size for o in close_orders)
+            except asyncio.TimeoutError:
+                self.logger.log("Timeout getting active orders", "WARNING")
+                order_count = 0
+                order_size = Decimal(0)
+            except Exception as e:
+                self.logger.log(f"Error getting active orders: {e}", "WARNING")
+                order_count = 0
+                order_size = Decimal(0)
+            
+            # Get total trades
+            total_trades = self._get_total_trades()
+            
+            # Calculate PnL
+            absolute_pnl, percentage_pnl, apr = self._calculate_pnl(current_margin, initial_margin)
+            
+            # Format status report with HTML bold tags and compact layout
+            initial_margin_str = f"{initial_margin:.4f}" if initial_margin > 0 else "N/A"
+            current_margin_str = f"{current_margin:.4f}" if current_margin > 0 else "N/A"
+            current_price_str = f"{current_price:.4f}" if current_price > 0 else "N/A"
+            
+            status = f"<b>🧾 账户状态报告</b>\n"
+            status += f"<b>📋 Account Status Report</b>\n\n"
+            status += f"<b>👤 账户名称 Account Name:</b> {account_name}\n"
+            status += f"<b>🏦 交易所 Exchange:</b> {exchange_name}\n"
+            status += f"<b>💰 初始保证金 Initial Margin:</b> {initial_margin_str}\n"
+            status += f"<b>🎯 交易对 Ticker:</b> {ticker}\n"
+            status += f"<b>💵 当前价格 Current Price:</b> {current_price_str}\n"
+            status += f"<b>{direction_icon} 交易方向 Direction:</b> {direction}\n"
+            status += f"<b>⏱️ 运行时长 Runtime:</b> {runtime}\n\n"
+            status += f"<b>💼 当前保证金 Current Margin:</b> {current_margin_str}\n"
+            status += f"<b>📊 持仓 Position:</b> {position}\n"
+            status += f"<b>{mmr_risk_indicator} 持仓MMR Position MMR:</b> {position_mmr}\n"
+            status += f"<b>📑 挂单数量 Active Orders:</b> {order_count}\n"
+            status += f"<b>⚖️ 挂单总量 Order Size:</b> {order_size}\n"
+            status += f"<b>🔁 累计交易次数 Total Trades:</b> {total_trades}\n\n"
+            status += f"<b>💹 账户盈亏 PnL:</b>\n"
+            
+            if absolute_pnl is not None:
+                # Convert Decimal to float for formatting with automatic sign
+                absolute_pnl_float = float(absolute_pnl)
+                percentage_pnl_float = float(percentage_pnl)
+                apr_float = float(apr)
+                status += f"<b>📈 绝对盈亏 Absolute:</b> {absolute_pnl_float:+.4f}\n"
+                status += f"<b>📉 百分比盈亏 Percentage:</b> {percentage_pnl_float:+.2f}%\n"
+                status += f"<b>📅 年化收益 APR:</b> {apr_float:+.2f}%\n"
+            else:
+                status += f"<b>📈 绝对盈亏 Absolute:</b> N/A\n"
+                status += f"<b>📉 百分比盈亏 Percentage:</b> N/A\n"
+                status += f"<b>📅 年化收益 APR:</b> N/A\n"
+            
+            return status
+            
+        except Exception as e:
+            error_detail = str(e) if str(e) else f"{type(e).__name__}"
+            self.logger.log(f"Error generating status: {error_detail}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return f"获取状态时出错: {error_detail}"
+
+    async def _send_connection_notification(self):
+        """Send connection notification to Telegram with account information."""
+        try:
+            # Get account name
+            account_name = os.getenv('ACCOUNT_NAME', 'N/A')
+            
+            # Get exchange name
+            exchange_name = self.config.exchange.upper()
+            
+            # Get current time
+            import pytz
+            timezone = pytz.timezone(os.getenv('TIMEZONE', 'Asia/Shanghai'))
+            current_time = datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Get account balance/margin
+            try:
+                current_margin = await self.get_account_balance()
+                margin_str = f"{current_margin:.4f}" if current_margin else "N/A"
+            except:
+                margin_str = "N/A"
+            
+            # Get position
+            try:
+                position = await self.exchange_client.get_account_positions()
+                position = abs(position)
+                position_str = f"{position}"
+            except:
+                position_str = "N/A"
+            
+            # Get active orders
+            try:
+                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                close_orders = [o for o in active_orders if o.side == self.config.close_order_side]
+                order_count = len(close_orders)
+                order_size = sum(o.size for o in close_orders)
+                order_info = f"挂单数量: {order_count} | 挂单总量: {order_size}"
+            except:
+                order_info = "挂单信息获取失败"
+            
+            # Get current price
+            try:
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                # Ensure both are Decimal
+                best_bid = Decimal(best_bid) if not isinstance(best_bid, Decimal) else best_bid
+                best_ask = Decimal(best_ask) if not isinstance(best_ask, Decimal) else best_ask
+                current_price = (best_bid + best_ask) / Decimal(2) if best_bid > 0 and best_ask > 0 else best_ask if best_ask > 0 else best_bid
+                price_str = f"{current_price:.4f}" if current_price > 0 else "N/A"
+            except:
+                price_str = "N/A"
+            
+            # Get direction with icon
+            direction = self.config.direction.upper()
+            direction_icon = "📈" if direction == "BUY" else "📉"
+            
+            # Calculate MMR risk indicator and value if position exists
+            mmr_risk_indicator = ""
+            mmr_str = "N/A"
+            if position_str != "N/A" and float(position_str) > 0 and margin_str != "N/A" and price_str != "N/A":
+                try:
+                    position_decimal = Decimal(position_str)
+                    current_price_decimal = Decimal(current_price) if not isinstance(current_price, Decimal) else current_price
+                    position_value = position_decimal * current_price_decimal if current_price_decimal > 0 else Decimal(0)
+                    if position_value > 0:
+                        margin_decimal = Decimal(margin_str)
+                        mmr_ratio = (margin_decimal / position_value) * Decimal(100)
+                        mmr_ratio_float = float(mmr_ratio)
+                        # Risk indicator based on margin ratio (lower = higher risk)
+                        if mmr_ratio_float < 5:
+                            mmr_risk_indicator = "🔴"  # Red: High risk
+                            mmr_str = f"{mmr_ratio_float:.2f}% (高风险 High Risk)"
+                        elif mmr_ratio_float < 10:
+                            mmr_risk_indicator = "🟡"  # Yellow: Medium risk
+                            mmr_str = f"{mmr_ratio_float:.2f}% (中风险 Medium Risk)"
+                        else:
+                            mmr_risk_indicator = "🟢"  # Green: Low risk
+                            mmr_str = f"{mmr_ratio_float:.2f}% (低风险 Low Risk)"
+                except Exception as e:
+                    self.logger.log(f"Error calculating MMR in connection notification: {e}", "WARNING")
+            elif position_str != "N/A" and float(position_str) == 0:
+                mmr_risk_indicator = "⚪"  # White: No position
+                mmr_str = "N/A (无持仓 No Position)"
+            
+            # Format connection notification with HTML bold tags and compact layout
+            notification = f"<b>✅ 交易机器人已连接</b>\n"
+            notification += f"<b>✅ Trading Bot Connected</b>\n\n"
+            notification += f"<b>👤 账户名称 Account Name:</b> {account_name}\n"
+            notification += f"<b>🕐 连接时间 Connection Time:</b> {current_time}\n"
+            notification += f"<b>🏦 交易所 Exchange:</b> {exchange_name}\n"
+            notification += f"<b>🎯 交易对 Ticker:</b> {self.config.ticker}\n"
+            notification += f"<b>💵 当前价格 Current Price:</b> {price_str}\n"
+            notification += f"<b>{direction_icon} 交易方向 Direction:</b> {direction}\n\n"
+            notification += f"<b>💰 账户余额 Account Balance:</b> {margin_str}\n"
+            notification += f"<b>📊 当前仓位 Current Position:</b> {position_str}\n"
+            notification += f"<b>{mmr_risk_indicator} 持仓MMR Position MMR:</b> {mmr_str}\n"
+            notification += f"<b>📑 挂单情况 Active Orders:</b> {order_info}\n\n"
+            notification += f"<b>⚙️ 交易配置 Trading Config:</b>\n"
+            notification += f"<b>  • 数量 Quantity:</b> {self.config.quantity}\n"
+            notification += f"<b>  • 止盈 Take Profit:</b> {self.config.take_profit}%\n"
+            notification += f"<b>  • 最大挂单 Max Orders:</b> {self.config.max_orders}\n"
+            notification += f"<b>  • 等待时间 Wait Time:</b> {self.config.wait_time}s\n"
+            notification += f"<b>  • 网格步长 Grid Step:</b> {self.config.grid_step}%\n"
+            
+            # Send notification
+            await self.send_notification(notification)
+            
+        except Exception as e:
+            self.logger.log(f"Error sending connection notification: {e}", "ERROR")
+
     async def run(self):
         """Main trading loop."""
         try:
@@ -516,6 +888,23 @@ class TradingBot:
 
             # wait for connection to establish
             await asyncio.sleep(5)
+
+            # Record start time and initial margin
+            self.start_time = time.time()
+            try:
+                self.initial_margin = await self.get_account_balance()
+                if self.initial_margin is not None:
+                    self.logger.log(f"初始保证金 (Initial Margin): {self.initial_margin:.4f}", "INFO")
+                else:
+                    self.logger.log("Failed to get initial margin: returned None", "WARNING")
+            except Exception as e:
+                self.logger.log(f"Failed to get initial margin: {e}", "WARNING")
+                self.initial_margin = None
+
+            # Send connection notification to Telegram
+            if not self.connection_notification_sent:
+                await self._send_connection_notification()
+                self.connection_notification_sent = True
 
             # Main trading loop
             while not self.shutdown_requested:

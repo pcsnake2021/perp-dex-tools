@@ -6,12 +6,14 @@ Modular Trading Bot - Supports multiple exchanges
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 import sys
 import dotenv
 from decimal import Decimal
 from trading_bot import TradingBot, TradingConfig
 from exchanges import ExchangeFactory
+from helpers.telegram_command_handler import TelegramCommandHandler
 
 
 def parse_arguments():
@@ -121,12 +123,26 @@ async def main():
 
     # Create and run the bot
     bot = TradingBot(config)
+    
+    # Start Telegram command handler if configured
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    command_handler = None
+    
+    if telegram_token and telegram_chat_id:
+        command_handler = TelegramCommandHandler(bot, telegram_token, telegram_chat_id)
+        # Start command handler in background
+        asyncio.create_task(command_handler.start())
+    
     try:
         await bot.run()
     except Exception as e:
         print(f"Bot execution failed: {e}")
         # The bot's run method already handles graceful shutdown
         return
+    finally:
+        if command_handler:
+            command_handler.stop()
 
 
 if __name__ == "__main__":

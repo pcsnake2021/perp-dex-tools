@@ -564,6 +564,28 @@ class BackpackClient(BaseExchangeClient):
                 break
         return position_amt
 
+    @query_retry(default_return=None)
+    async def get_account_margin(self) -> Optional[Decimal]:
+        """Get account margin/collateral using official SDK."""
+        try:
+            collateral_data = self.account_client.get_collateral()
+            if collateral_data and isinstance(collateral_data, dict):
+                total_collateral = collateral_data.get('totalCollateral', 0)
+                if total_collateral:
+                    return Decimal(str(total_collateral))
+            # Fallback: try to get from balances
+            balances = self.account_client.get_balances()
+            if balances and isinstance(balances, list):
+                for balance in balances:
+                    if balance.get('asset', '') == 'USDC':
+                        available = Decimal(str(balance.get('available', 0)))
+                        if available > 0:
+                            return available
+            return None
+        except Exception as e:
+            self.logger.log(f"Error getting account margin: {e}", "WARNING")
+            return None
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
         ticker = self.config.ticker

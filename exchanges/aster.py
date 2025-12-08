@@ -739,6 +739,41 @@ class AsterClient(BaseExchangeClient):
 
         return Decimal(0)
 
+    @query_retry(default_return=None)
+    async def get_account_balance(self) -> Optional[Decimal]:
+        """Get account balance/margin."""
+        try:
+            # Aster uses /fapi/v2/account endpoint
+            result = await self._make_request('GET', '/fapi/v2/account')
+            if not result:
+                self.logger.log(f"Aster: No account data returned", "WARNING")
+                return None
+            
+            # Try to get balance from account data
+            # Aster Binance-style API typically uses totalWalletBalance
+            balance = (result.get('totalWalletBalance') or 
+                      result.get('totalMarginBalance') or 
+                      result.get('availableBalance') or 
+                      result.get('balance') or
+                      result.get('totalEquity') or
+                      result.get('totalBalance') or
+                      result.get('accountEquity'))
+            
+            if balance is not None:
+                try:
+                    return Decimal(str(balance))
+                except (ValueError, TypeError) as e:
+                    self.logger.log(f"Aster: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+            
+            # Log sample data for debugging
+            self.logger.log(f"Aster: Could not find balance field. Account data sample: {str(result)[:500]}", "WARNING")
+            return None
+        except Exception as e:
+            self.logger.log(f"Failed to get account balance: {e}", "WARNING")
+            import traceback
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+            return None
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size for a ticker."""
         ticker = self.config.ticker
