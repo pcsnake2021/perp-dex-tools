@@ -804,6 +804,11 @@ class TradingBot:
     async def _check_stop_loss(self) -> bool:
         """Check stop loss conditions and trigger if needed.
         
+        Stop loss is calculated based on:
+        - Initial margin: account balance when bot started
+        - Current balance: current account balance (including unrealized PnL)
+        - Loss percentage: (initial_margin - current_balance) / initial_margin * 100
+        
         Returns:
             True if stop loss was triggered (should enter silent mode)
             False otherwise
@@ -818,12 +823,34 @@ class TradingBot:
         if current_balance is None:
             return False
         
-        # Calculate loss from initial capital
+        # Validate that both values are positive
+        if self.initial_margin <= 0:
+            self.logger.log(f"[Stop Loss Check] Invalid initial_margin: {self.initial_margin:.4f}, skipping check", "WARNING")
+            return False
+        
+        if current_balance <= 0:
+            self.logger.log(f"[Stop Loss Check] Invalid current_balance: {current_balance:.4f}, skipping check", "WARNING")
+            return False
+        
+        # Only check stop loss if we're actually losing money
+        # If current balance >= initial margin, we're not losing, so skip stop loss check
+        if current_balance >= self.initial_margin:
+            return False
+        
+        # Calculate loss from initial capital (only when current_balance < initial_margin)
+        # Loss = Initial Margin - Current Balance
         loss = self.initial_margin - current_balance
-        if self.initial_margin > 0:
-            loss_percentage = (loss / self.initial_margin) * Decimal(100)
-        else:
-            loss_percentage = Decimal(0)
+        
+        # Loss Percentage = (Loss / Initial Margin) * 100
+        # This represents the percentage drop from initial capital
+        loss_percentage = (loss / self.initial_margin) * Decimal(100)
+        
+        # Add debug logging to help diagnose issues
+        self.logger.log(f"[Stop Loss Check] Initial Margin: {self.initial_margin:.4f}, "
+                       f"Current Balance: {current_balance:.4f}, "
+                       f"Loss: {loss:.4f}, "
+                       f"Loss %: {loss_percentage:.2f}%, "
+                       f"Threshold: {self.config.stop_loss_threshold}%", "DEBUG")
         
         # Check if loss exceeds threshold
         if loss_percentage >= self.config.stop_loss_threshold:
