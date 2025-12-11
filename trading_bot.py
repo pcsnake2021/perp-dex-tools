@@ -436,24 +436,60 @@ class TradingBot:
             next_close_order = picker(self.active_close_orders, key=lambda o: o["price"])
             next_close_price = next_close_order["price"]
 
-            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
-            if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
-                raise ValueError("No bid/ask data available")
-
-            if self.config.direction == "buy":
-                new_order_close_price = best_ask * (1 + self.config.take_profit/100)
-                if next_close_price / new_order_close_price > 1 + self.config.grid_step/100:
-                    return True
-                else:
-                    return False
-            elif self.config.direction == "sell":
-                new_order_close_price = best_bid * (1 - self.config.take_profit/100)
-                if new_order_close_price / next_close_price > 1 + self.config.grid_step/100:
-                    return True
-                else:
-                    return False
-            else:
-                raise ValueError(f"Invalid direction: {self.config.direction}")
+            # Retry logic for fetching prices
+            max_retries = 3
+            retry_delay = 2
+            for attempt in range(max_retries):
+                try:
+                    price_result = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                    if price_result is None:
+                        if attempt < max_retries - 1:
+                            self.logger.log(
+                                f"Failed to fetch bid/ask prices (attempt {attempt + 1}/{max_retries}), retrying...",
+                                "WARNING"
+                            )
+                            await asyncio.sleep(retry_delay * (attempt + 1))
+                            continue
+                        else:
+                            raise ValueError("No bid/ask data available after retries")
+                    
+                    best_bid, best_ask = price_result
+                    if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                        if attempt < max_retries - 1:
+                            self.logger.log(
+                                f"Invalid bid/ask prices (attempt {attempt + 1}/{max_retries}), retrying...",
+                                "WARNING"
+                            )
+                            await asyncio.sleep(retry_delay * (attempt + 1))
+                            continue
+                        else:
+                            raise ValueError("No bid/ask data available")
+                    
+                    # Successfully got valid prices
+                    if self.config.direction == "buy":
+                        new_order_close_price = best_ask * (1 + self.config.take_profit/100)
+                        if next_close_price / new_order_close_price > 1 + self.config.grid_step/100:
+                            return True
+                        else:
+                            return False
+                    elif self.config.direction == "sell":
+                        new_order_close_price = best_bid * (1 - self.config.take_profit/100)
+                        if new_order_close_price / next_close_price > 1 + self.config.grid_step/100:
+                            return True
+                        else:
+                            return False
+                    else:
+                        raise ValueError(f"Invalid direction: {self.config.direction}")
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        self.logger.log(
+                            f"Error fetching prices (attempt {attempt + 1}/{max_retries}): {e}, retrying...",
+                            "WARNING"
+                        )
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                        continue
+                    else:
+                        raise ValueError(f"No bid/ask data available: {e}")
         else:
             return True
 
@@ -464,7 +500,11 @@ class TradingBot:
         if self.config.pause_price == self.config.stop_price == -1:
             return stop_trading, pause_trading
 
-        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+        price_result = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+        if price_result is None:
+            raise ValueError("No bid/ask data available")
+        
+        best_bid, best_ask = price_result
         if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
             raise ValueError("No bid/ask data available")
 
@@ -606,14 +646,18 @@ class TradingBot:
             
             # Get current price with timeout
             try:
-                best_bid, best_ask = await asyncio.wait_for(
+                price_result = await asyncio.wait_for(
                     self.exchange_client.fetch_bbo_prices(self.config.contract_id),
                     timeout=5.0
                 )
-                # Ensure both are Decimal
-                best_bid = Decimal(best_bid) if not isinstance(best_bid, Decimal) else best_bid
-                best_ask = Decimal(best_ask) if not isinstance(best_ask, Decimal) else best_ask
-                current_price = (best_bid + best_ask) / Decimal(2) if best_bid > 0 and best_ask > 0 else best_ask if best_ask > 0 else best_bid
+                if price_result is None:
+                    current_price = Decimal(0)
+                else:
+                    best_bid, best_ask = price_result
+                    # Ensure both are Decimal
+                    best_bid = Decimal(best_bid) if not isinstance(best_bid, Decimal) else best_bid
+                    best_ask = Decimal(best_ask) if not isinstance(best_ask, Decimal) else best_ask
+                    current_price = (best_bid + best_ask) / Decimal(2) if best_bid > 0 and best_ask > 0 else best_ask if best_ask > 0 else best_bid
             except asyncio.TimeoutError:
                 self.logger.log("Timeout fetching price", "WARNING")
                 current_price = Decimal(0)
@@ -793,12 +837,16 @@ class TradingBot:
             
             # Get current price
             try:
-                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
-                # Ensure both are Decimal
-                best_bid = Decimal(best_bid) if not isinstance(best_bid, Decimal) else best_bid
-                best_ask = Decimal(best_ask) if not isinstance(best_ask, Decimal) else best_ask
-                current_price = (best_bid + best_ask) / Decimal(2) if best_bid > 0 and best_ask > 0 else best_ask if best_ask > 0 else best_bid
-                price_str = f"{current_price:.4f}" if current_price > 0 else "N/A"
+                price_result = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                if price_result is None:
+                    price_str = "N/A"
+                else:
+                    best_bid, best_ask = price_result
+                    # Ensure both are Decimal
+                    best_bid = Decimal(best_bid) if not isinstance(best_bid, Decimal) else best_bid
+                    best_ask = Decimal(best_ask) if not isinstance(best_ask, Decimal) else best_ask
+                    current_price = (best_bid + best_ask) / Decimal(2) if best_bid > 0 and best_ask > 0 else best_ask if best_ask > 0 else best_bid
+                    price_str = f"{current_price:.4f}" if current_price > 0 else "N/A"
             except:
                 price_str = "N/A"
             

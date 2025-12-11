@@ -389,8 +389,52 @@ class AsterClient(BaseExchangeClient):
                 params['signature'] = signature
 
                 async with session.get(url, params=params, headers=headers) as response:
-                    result = await response.json()
+                    # Check content type before parsing JSON
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    
+                    # Handle 429 rate limit errors with longer wait time
+                    if response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', 60))
+                        error_msg = f"Rate limit exceeded (429). Retry after {retry_after} seconds"
+                        self.logger.log(error_msg, "WARNING")
+                        # Raise a specific exception that can be caught and retried
+                        raise Exception(f"RATE_LIMIT_429: {error_msg}")
+                    
+                    # Try to parse JSON, but handle non-JSON responses gracefully
+                    try:
+                        if 'application/json' in content_type:
+                            result = await response.json()
+                        else:
+                            # If not JSON, read as text first
+                            text_result = await response.text()
+                            try:
+                                result = json.loads(text_result)
+                            except json.JSONDecodeError:
+                                # If still not valid JSON, create error dict
+                                result = {
+                                    'code': response.status,
+                                    'msg': f'Non-JSON response: {text_result[:200]}'
+                                }
+                    except Exception as e:
+                        # If JSON parsing fails, read text and create error dict
+                        text_result = await response.text()
+                        result = {
+                            'code': response.status,
+                            'msg': f'Failed to parse response: {str(e)}, content: {text_result[:200]}'
+                        }
+                    
                     if response.status != 200:
+                        # Check for specific error codes
+                        error_code = result.get('code', response.status)
+                        error_msg = result.get('msg', 'Unknown error')
+                        
+                        # Log specific error codes
+                        if error_code == -2029:
+                            self.logger.log(
+                                f"Maximum notional value limit reached (-2029): {error_msg}", 
+                                "ERROR"
+                            )
+                        
                         raise Exception(f"API request failed: {result}")
                     return result
             elif method.upper() == 'POST':
@@ -401,8 +445,52 @@ class AsterClient(BaseExchangeClient):
                 all_params['signature'] = signature
 
                 async with session.post(url, data=all_params, headers=headers) as response:
-                    result = await response.json()
+                    # Check content type before parsing JSON
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    
+                    # Handle 429 rate limit errors with longer wait time
+                    if response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', 60))
+                        error_msg = f"Rate limit exceeded (429). Retry after {retry_after} seconds"
+                        self.logger.log(error_msg, "WARNING")
+                        # Raise a specific exception that can be caught and retried
+                        raise Exception(f"RATE_LIMIT_429: {error_msg}")
+                    
+                    # Try to parse JSON, but handle non-JSON responses gracefully
+                    try:
+                        if 'application/json' in content_type:
+                            result = await response.json()
+                        else:
+                            # If not JSON, read as text first
+                            text_result = await response.text()
+                            try:
+                                result = json.loads(text_result)
+                            except json.JSONDecodeError:
+                                # If still not valid JSON, create error dict
+                                result = {
+                                    'code': response.status,
+                                    'msg': f'Non-JSON response: {text_result[:200]}'
+                                }
+                    except Exception as e:
+                        # If JSON parsing fails, read text and create error dict
+                        text_result = await response.text()
+                        result = {
+                            'code': response.status,
+                            'msg': f'Failed to parse response: {str(e)}, content: {text_result[:200]}'
+                        }
+                    
                     if response.status != 200:
+                        # Check for specific error codes
+                        error_code = result.get('code', response.status)
+                        error_msg = result.get('msg', 'Unknown error')
+                        
+                        # Log specific error codes
+                        if error_code == -2029:
+                            self.logger.log(
+                                f"Maximum notional value limit reached (-2029): {error_msg}", 
+                                "ERROR"
+                            )
+                        
                         raise Exception(f"API request failed: {result}")
                     return result
             elif method.upper() == 'DELETE':
@@ -411,8 +499,52 @@ class AsterClient(BaseExchangeClient):
                 params['signature'] = signature
 
                 async with session.delete(url, params=params, headers=headers) as response:
-                    result = await response.json()
+                    # Check content type before parsing JSON
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    
+                    # Handle 429 rate limit errors with longer wait time
+                    if response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', 60))
+                        error_msg = f"Rate limit exceeded (429). Retry after {retry_after} seconds"
+                        self.logger.log(error_msg, "WARNING")
+                        # Raise a specific exception that can be caught and retried
+                        raise Exception(f"RATE_LIMIT_429: {error_msg}")
+                    
+                    # Try to parse JSON, but handle non-JSON responses gracefully
+                    try:
+                        if 'application/json' in content_type:
+                            result = await response.json()
+                        else:
+                            # If not JSON, read as text first
+                            text_result = await response.text()
+                            try:
+                                result = json.loads(text_result)
+                            except json.JSONDecodeError:
+                                # If still not valid JSON, create error dict
+                                result = {
+                                    'code': response.status,
+                                    'msg': f'Non-JSON response: {text_result[:200]}'
+                                }
+                    except Exception as e:
+                        # If JSON parsing fails, read text and create error dict
+                        text_result = await response.text()
+                        result = {
+                            'code': response.status,
+                            'msg': f'Failed to parse response: {str(e)}, content: {text_result[:200]}'
+                        }
+                    
                     if response.status != 200:
+                        # Check for specific error codes
+                        error_code = result.get('code', response.status)
+                        error_msg = result.get('msg', 'Unknown error')
+                        
+                        # Log specific error codes
+                        if error_code == -2029:
+                            self.logger.log(
+                                f"Maximum notional value limit reached (-2029): {error_msg}", 
+                                "ERROR"
+                            )
+                        
                         raise Exception(f"API request failed: {result}")
                     return result
 
@@ -462,19 +594,48 @@ class AsterClient(BaseExchangeClient):
         except Exception as e:
             self.logger.log(f"Error handling WebSocket order update: {e}", "ERROR")
 
-    @query_retry(default_return=(0, 0))
-    async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
-        """Fetch best bid and ask prices from Aster."""
-        result = await self._make_request('GET', '/fapi/v1/ticker/bookTicker', {'symbol': contract_id})
+    @query_retry(default_return=None, max_attempts=5, min_wait=2, max_wait=60, reraise=False)
+    async def fetch_bbo_prices(self, contract_id: str) -> Optional[Tuple[Decimal, Decimal]]:
+        """Fetch best bid and ask prices from Aster.
+        
+        Returns:
+            Tuple[Decimal, Decimal]: (best_bid, best_ask) if successful, None if failed after retries
+        """
+        try:
+            result = await self._make_request('GET', '/fapi/v1/ticker/bookTicker', {'symbol': contract_id})
 
-        best_bid = Decimal(result.get('bidPrice', 0))
-        best_ask = Decimal(result.get('askPrice', 0))
+            best_bid = Decimal(result.get('bidPrice', 0))
+            best_ask = Decimal(result.get('askPrice', 0))
 
-        return best_bid, best_ask
+            # Validate the prices
+            if best_bid <= 0 or best_ask <= 0:
+                self.logger.log(f"Invalid bid/ask prices: bid={best_bid}, ask={best_ask}", "WARNING")
+                raise ValueError(f"Invalid bid/ask prices: bid={best_bid}, ask={best_ask}")
+
+            return best_bid, best_ask
+        except Exception as e:
+            error_str = str(e)
+            # For rate limit errors, wait longer before retrying
+            if 'RATE_LIMIT_429' in error_str:
+                # Extract retry-after time if available
+                retry_after = 60  # Default 60 seconds
+                if 'Retry after' in error_str:
+                    try:
+                        retry_after = int(error_str.split('Retry after')[1].split()[0])
+                    except:
+                        pass
+                self.logger.log(f"Rate limit hit, waiting {retry_after} seconds before retry", "WARNING")
+                await asyncio.sleep(retry_after)
+            raise
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with Aster using official SDK."""
-        best_bid, best_ask = await self.fetch_bbo_prices(self.config.contract_id)
+        price_result = await self.fetch_bbo_prices(self.config.contract_id)
+        if price_result is None:
+            self.logger.log("Failed to fetch bid/ask prices", "ERROR")
+            raise ValueError("Failed to fetch bid/ask prices")
+        
+        best_bid, best_ask = price_result
         if best_bid <= 0 or best_ask <= 0:
             self.logger.log("Invalid bid/ask prices", "ERROR")
             raise ValueError("Invalid bid/ask prices")
@@ -503,8 +664,11 @@ class AsterClient(BaseExchangeClient):
                     self.logger.log(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}", "ERROR")
                     raise Exception(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}")
 
-            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
+            price_result = await self.fetch_bbo_prices(contract_id)
+            if price_result is None:
+                return OrderResult(success=False, error_message='Failed to fetch bid/ask prices')
+            
+            best_bid, best_ask = price_result
             if best_bid <= 0 or best_ask <= 0:
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
@@ -575,8 +739,11 @@ class AsterClient(BaseExchangeClient):
                 else:
                     active_close_orders = current_close_orders
             # Get current market prices to adjust order price if needed
-            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
+            price_result = await self.fetch_bbo_prices(contract_id)
+            if price_result is None:
+                return OrderResult(success=False, error_message='Failed to fetch bid/ask prices')
+            
+            best_bid, best_ask = price_result
             if best_bid <= 0 or best_ask <= 0:
                 return OrderResult(success=False, error_message='No bid/ask data available')
 
