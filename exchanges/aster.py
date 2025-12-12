@@ -908,7 +908,7 @@ class AsterClient(BaseExchangeClient):
 
     @query_retry(default_return=None)
     async def get_account_balance(self) -> Optional[Decimal]:
-        """Get account balance/margin."""
+        """Get account balance/margin including unrealized PnL."""
         try:
             # Aster uses /fapi/v2/account endpoint
             result = await self._make_request('GET', '/fapi/v2/account')
@@ -916,21 +916,59 @@ class AsterClient(BaseExchangeClient):
                 self.logger.log(f"Aster: No account data returned", "WARNING")
                 return None
             
-            # Try to get balance from account data
-            # Aster Binance-style API typically uses totalWalletBalance
-            balance = (result.get('totalWalletBalance') or 
-                      result.get('totalMarginBalance') or 
-                      result.get('availableBalance') or 
-                      result.get('balance') or
-                      result.get('totalEquity') or
-                      result.get('totalBalance') or
-                      result.get('accountEquity'))
+            # Priority: totalMarginBalance (includes unrealized PnL) > totalWalletBalance (includes unrealized PnL)
+            # If neither exists, try to calculate: base balance + unrealized PnL
+            balance = None
+            unrealized_pnl = Decimal(0)
+            
+            # Try to get unrealized PnL if available
+            if 'totalUnrealizedProfit' in result:
+                try:
+                    unrealized_pnl = Decimal(str(result.get('totalUnrealizedProfit', 0)))
+                except (ValueError, TypeError):
+                    unrealized_pnl = Decimal(0)
+            
+            # Priority 1: totalMarginBalance (most accurate, includes unrealized PnL)
+            if 'totalMarginBalance' in result:
+                try:
+                    balance = Decimal(str(result.get('totalMarginBalance')))
+                except (ValueError, TypeError):
+                    pass
+            
+            # Priority 2: totalWalletBalance (includes unrealized PnL)
+            if balance is None and 'totalWalletBalance' in result:
+                try:
+                    balance = Decimal(str(result.get('totalWalletBalance')))
+                except (ValueError, TypeError):
+                    pass
+            
+            # Priority 3: If we have base balance and unrealized PnL, calculate total
+            if balance is None:
+                base_balance = None
+                # Try to get base balance (without unrealized PnL)
+                for field in ['availableBalance', 'balance', 'totalBalance', 'accountEquity', 'totalEquity']:
+                    if field in result:
+                        try:
+                            base_balance = Decimal(str(result.get(field)))
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                
+                if base_balance is not None:
+                    # Add unrealized PnL to base balance
+                    balance = base_balance + unrealized_pnl
+                elif unrealized_pnl != 0:
+                    # If we only have unrealized PnL, try to get any balance field and add it
+                    for field in ['availableBalance', 'balance', 'totalBalance', 'accountEquity', 'totalEquity']:
+                        if field in result:
+                            try:
+                                balance = Decimal(str(result.get(field))) + unrealized_pnl
+                                break
+                            except (ValueError, TypeError):
+                                continue
             
             if balance is not None:
-                try:
-                    return Decimal(str(balance))
-                except (ValueError, TypeError) as e:
-                    self.logger.log(f"Aster: Failed to convert balance to Decimal: {balance}, error: {e}", "WARNING")
+                return balance
             
             # Log sample data for debugging
             self.logger.log(f"Aster: Could not find balance field. Account data sample: {str(result)[:500]}", "WARNING")
